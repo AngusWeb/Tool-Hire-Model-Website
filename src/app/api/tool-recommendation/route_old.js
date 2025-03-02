@@ -3,7 +3,7 @@ import { promises as fs } from "fs";
 import path from "path";
 
 // API key for Google's Gemini API
-const API_KEY = "AIzaSyBvrYL4Mh6qRsnokxaPIJg6qnYV5rHlzYE";
+const API_KEY = "";
 
 /**
  * API route handler for Next.js
