@@ -85,7 +85,7 @@ export default function ToolHireChatbot() {
               {
                 role: "system",
                 content:
-                  "Information gathering complete. Analyzing your project needs...",
+                  "Information gathering complete. Analysing your project needs...",
               },
             ]);
 

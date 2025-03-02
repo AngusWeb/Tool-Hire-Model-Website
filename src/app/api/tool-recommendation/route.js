@@ -156,23 +156,26 @@ async function handleInformationGathering(userInput, conversationHistory = []) {
 async function handleToolRecommendation(projectInformation) {
   // Read the tool information from file
   let toolInformation;
+  let productUrls;
   try {
     toolInformation = await readFromFile("tool_information.txt");
+    productUrls = await readFromFile("product_urls.txt");
   } catch (error) {
-    console.error("Error reading tool information:", error);
+    console.error("Error reading information files:", error);
     return {
-      text: "Error: Unable to access tool information. Please try again later.",
+      text: "Error: Unable to access tool information or product URLs. Please try again later.",
       error: true,
     };
   }
 
   const model = initializeGeminiModel();
 
-  // Create the prompt for tool recommendations
   const prompt = PROMPT_TEMPLATE.replace(
     "{project_information}",
     projectInformation
-  ).replace("{tool_information}", toolInformation);
+  )
+    .replace("{tool_information}", toolInformation)
+    .replace("{product_urls_file}", productUrls);
 
   // Send the prompt to Gemini API using the new SDK
   const result = await model.generateContent(prompt);
@@ -183,7 +186,6 @@ async function handleToolRecommendation(projectInformation) {
     error: false,
   };
 }
-
 /**
  * Helper function to read content from a file
  * @param {string} filename - The name of the file
@@ -350,7 +352,7 @@ Your Tasks:
    - Explain why each recommended tool is suitable (e.g., power requirements, capacity, safety features, efficiency).
    - If the customer already owns any of the recommended equipment, they can disregard that specific recommendation.
    - If the experience level of the user is unclear, label each tool as either "Easy to use" or "Requires experience" to guide their selection.
-   - Include the URL for each recommended product if it's present in the tool information.
+   - Include the URL for each recommended product by matching the product name with the corresponding URL in the product URLs file.
 3. Recommended Hire Duration
    - Provide an estimated timeframe for how long each recommended tool should be hired to complete the project.
    - Justify your estimate (e.g., typical usage patterns, project scope, professional guidelines).
@@ -362,16 +364,18 @@ Your Tasks:
    - Use direct language (e.g., "Be mindful of noise restrictions" rather than "Remind the customer to be mindful of noise restrictions").
 
 Important:
-- Use only the information provided in the project information and tool information sections below.
+- Use only the information provided in the project information, tool information, and product URL sections below.
 - If the information is contradictory or incomplete, highlight the issue and explain how it affects your recommendation.
 - If you are unsure about any tool selection or hire duration, explicitly mention that and request further details.
 
 ---
-Below are the two sources of information you have available:
-
+Below are the three sources of information you have available:
 Project Information:
 {project_information}
 
 Tool Information:
 {tool_information}
+
+Product URLs:
+{product_urls_file}
 `;
