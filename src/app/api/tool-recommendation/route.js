@@ -314,7 +314,7 @@ function initializeGeminiModel(modelName = "gemini-2.0-flash") {
       temperature: 0.7,
       topP: 0.95,
       topK: 64,
-      maxOutputTokens: 1600, // Setting max token output to 1600
+      maxOutputTokens: 3000, // Setting max token output to 1600
     },
   });
 }
