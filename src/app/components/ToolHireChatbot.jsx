@@ -15,7 +15,7 @@ export default function ToolHireChatbot() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [phase, setPhase] = useState("gathering"); // 'gathering' or 'recommendation'
-  const [conversationHistory, setConversationHistory] = useState([]); // Changed from conversationContext to conversationHistory array
+  const [conversationHistory, setConversationHistory] = useState([]);
   const [projectInformation, setProjectInformation] = useState("");
   const messagesEndRef = useRef(null);
   const [initialMessageSent, setInitialMessageSent] = useState(false);
@@ -38,7 +38,7 @@ export default function ToolHireChatbot() {
       setInput("");
 
       try {
-        // Call our backend API based on current phase
+        // Call our backend API with streaming enabled (but we won't show partial responses to user)
         const response = await fetch("/api/tool-recommendation", {
           method: "POST",
           headers: {
@@ -47,8 +47,9 @@ export default function ToolHireChatbot() {
           body: JSON.stringify({
             phase,
             userInput: messageToSend,
-            conversationHistory, // Send the conversation history array instead of context string
+            conversationHistory,
             projectInformation,
+            streaming: true, // Enable streaming on server-side
           }),
         });
 
@@ -56,28 +57,68 @@ export default function ToolHireChatbot() {
           throw new Error(`Server responded with status: ${response.status}`);
         }
 
-        const data = await response.json();
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let fullContent = "";
+        let completeData = null;
 
-        if (data.error) {
+        while (true) {
+          const { done, value } = await reader.read();
+
+          if (done) {
+            break;
+          }
+
+          // Process the chunks - each chunk is a JSON string followed by newline
+          const chunkText = decoder.decode(value);
+          const chunks = chunkText.split("\n").filter(Boolean);
+
+          for (const chunk of chunks) {
+            try {
+              const data = JSON.parse(chunk);
+
+              if (data.error) {
+                // Handle error
+                setMessages((prev) => [
+                  ...prev,
+                  { role: "system", content: data.text, error: true },
+                ]);
+                break;
+              }
+
+              if (!data.done) {
+                // Accumulate content but don't show it yet
+                fullContent += data.chunk;
+              } else {
+                // Stream complete, store the final data
+                completeData = data;
+                if (data.text) {
+                  // If the final message includes a complete text, use it
+                  fullContent = data.text;
+                }
+              }
+            } catch (error) {
+              console.error("Error parsing chunk:", error, chunk);
+            }
+          }
+        }
+
+        // Stream is complete, now display the full message to the user
+        if (completeData && fullContent) {
+          // Add AI response to chat only after stream is complete
           setMessages((prev) => [
             ...prev,
-            { role: "system", content: data.text, error: true },
-          ]);
-        } else {
-          // Add AI response to chat
-          setMessages((prev) => [
-            ...prev,
-            { role: "assistant", content: data.text },
+            { role: "assistant", content: fullContent },
           ]);
 
           // Update conversation history
-          if (data.conversationHistory) {
-            setConversationHistory(data.conversationHistory);
+          if (completeData.conversationHistory) {
+            setConversationHistory(completeData.conversationHistory);
           }
 
           // Check if information gathering phase is complete
-          if (data.isComplete && phase === "gathering") {
-            setProjectInformation(data.projectInformation);
+          if (completeData.isComplete && phase === "gathering") {
+            setProjectInformation(completeData.projectInformation);
 
             // Add transition message
             setMessages((prev) => [
@@ -94,7 +135,7 @@ export default function ToolHireChatbot() {
 
             // Automatically trigger the recommendation phase
             setTimeout(() => {
-              handleRecommendationPhase(data.projectInformation);
+              handleRecommendationPhase(completeData.projectInformation);
             }, 1000);
           }
         }
@@ -115,12 +156,13 @@ export default function ToolHireChatbot() {
       }
     },
     [input, phase, conversationHistory, projectInformation]
-  ); // Updated dependencies
+  );
 
   const handleRecommendationPhase = async (projectInfo) => {
     setIsLoading(true);
 
     try {
+      // Stream the recommendation phase response but hide streaming from user
       const response = await fetch("/api/tool-recommendation", {
         method: "POST",
         headers: {
@@ -129,6 +171,7 @@ export default function ToolHireChatbot() {
         body: JSON.stringify({
           phase: "recommendation",
           projectInformation: projectInfo,
+          streaming: true,
         }),
       });
 
@@ -136,22 +179,68 @@ export default function ToolHireChatbot() {
         throw new Error(`Server responded with status: ${response.status}`);
       }
 
-      const data = await response.json();
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullContent = "";
+      let streamComplete = false;
 
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: data.text },
-      ]);
+      while (true) {
+        const { done, value } = await reader.read();
 
-      // Add final message
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "system",
-          content:
-            "Thank you for using our DIY Project Tool Advisor! We hope this helps with your project.",
-        },
-      ]);
+        if (done) {
+          break;
+        }
+
+        // Process the chunks
+        const chunkText = decoder.decode(value);
+        const chunks = chunkText.split("\n").filter(Boolean);
+
+        for (const chunk of chunks) {
+          try {
+            const data = JSON.parse(chunk);
+
+            if (data.error) {
+              // Handle error
+              setMessages((prev) => [
+                ...prev,
+                { role: "system", content: data.text, error: true },
+              ]);
+              break;
+            }
+
+            if (!data.done) {
+              // Accumulate content but don't display yet
+              fullContent += data.chunk;
+            } else {
+              // Stream complete
+              streamComplete = true;
+              if (data.text) {
+                fullContent = data.text; // Use the complete text if provided
+              }
+            }
+          } catch (error) {
+            console.error("Error parsing chunk:", error, chunk);
+          }
+        }
+      }
+
+      if (streamComplete && fullContent) {
+        // Only add the message to the UI when stream is complete
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: fullContent },
+        ]);
+
+        // Add final message
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "system",
+            content:
+              "Thank you for using our DIY Project Tool Advisor! We hope this helps with your project.",
+          },
+        ]);
+      }
     } catch (error) {
       console.error("Error getting recommendations:", error);
       setMessages((prev) => [
