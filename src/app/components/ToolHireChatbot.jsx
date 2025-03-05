@@ -15,8 +15,10 @@ export default function ToolHireChatbot() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [phase, setPhase] = useState("gathering"); // 'gathering' or 'recommendation'
-  const [conversationHistory, setConversationHistory] = useState([]);
+  const [conversationHistory, setConversationHistory] = useState([]); // Changed from conversationContext to conversationHistory array
   const [projectInformation, setProjectInformation] = useState("");
+  const [streamingEnabled, setStreamingEnabled] = useState(true); // Enable streaming by default
+  const [currentStreamingMessage, setCurrentStreamingMessage] = useState(""); // State to hold current streaming message
   const messagesEndRef = useRef(null);
   const [initialMessageSent, setInitialMessageSent] = useState(false);
 
@@ -37,19 +39,250 @@ export default function ToolHireChatbot() {
       setIsLoading(true);
       setInput("");
 
+      // Add an empty assistant message for streaming if streaming is enabled
+      if (streamingEnabled) {
+        setCurrentStreamingMessage("");
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "", streaming: true },
+        ]);
+      }
+
       try {
-        // Call our backend API with streaming enabled (but we won't show partial responses to user)
+        if (streamingEnabled) {
+          // Streaming implementation
+          const response = await fetch("/api/tool-recommendation", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              phase,
+              userInput: messageToSend,
+              conversationHistory,
+              projectInformation,
+              streaming: true, // Request streaming response
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`Server responded with status: ${response.status}`);
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let fullContent = "";
+          let completeData = null;
+
+          while (true) {
+            const { done, value } = await reader.read();
+
+            if (done) {
+              break;
+            }
+
+            // Process the chunks - each chunk is a JSON string followed by newline
+            const chunkText = decoder.decode(value);
+            const chunks = chunkText.split("\n").filter(Boolean);
+
+            for (const chunk of chunks) {
+              try {
+                const data = JSON.parse(chunk);
+
+                if (data.error) {
+                  // Handle error
+                  setMessages((prev) => {
+                    const newMessages = [...prev];
+                    // Replace the streaming message with error message
+                    if (newMessages[newMessages.length - 1].streaming) {
+                      newMessages.pop(); // Remove streaming placeholder
+                    }
+                    return [
+                      ...newMessages,
+                      { role: "system", content: data.text, error: true },
+                    ];
+                  });
+                  break;
+                }
+
+                if (!data.done) {
+                  // Update the streaming message
+                  fullContent += data.chunk;
+                  setCurrentStreamingMessage(fullContent);
+
+                  // Update the last message in the messages array
+                  setMessages((prev) => {
+                    const newMessages = [...prev];
+                    if (newMessages[newMessages.length - 1].streaming) {
+                      newMessages[newMessages.length - 1].content = fullContent;
+                    }
+                    return newMessages;
+                  });
+                } else {
+                  // Stream complete, store the final data
+                  completeData = data;
+                }
+              } catch (error) {
+                console.error("Error parsing chunk:", error, chunk);
+              }
+            }
+          }
+
+          // Stream is complete, update with final data
+          if (completeData) {
+            // Remove the streaming flag
+            setMessages((prev) => {
+              const newMessages = [...prev];
+              if (newMessages[newMessages.length - 1].streaming) {
+                newMessages[newMessages.length - 1].streaming = false;
+              }
+              return newMessages;
+            });
+
+            // Update conversation history
+            if (completeData.conversationHistory) {
+              setConversationHistory(completeData.conversationHistory);
+            }
+
+            // Check if information gathering phase is complete
+            if (completeData.isComplete && phase === "gathering") {
+              setProjectInformation(completeData.projectInformation);
+
+              // Add transition message
+              setMessages((prev) => [
+                ...prev,
+                {
+                  role: "system",
+                  content:
+                    "Information gathering complete. Analysing your project needs...",
+                },
+              ]);
+
+              // Switch to recommendation phase
+              setPhase("recommendation");
+
+              // Automatically trigger the recommendation phase
+              setTimeout(() => {
+                handleRecommendationPhase(completeData.projectInformation);
+              }, 1000);
+            }
+          }
+        } else {
+          // Non-streaming implementation (original code)
+          const response = await fetch("/api/tool-recommendation", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              phase,
+              userInput: messageToSend,
+              conversationHistory,
+              projectInformation,
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`Server responded with status: ${response.status}`);
+          }
+
+          const data = await response.json();
+
+          if (data.error) {
+            setMessages((prev) => [
+              ...prev,
+              { role: "system", content: data.text, error: true },
+            ]);
+          } else {
+            // Add AI response to chat
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: data.text },
+            ]);
+
+            // Update conversation history
+            if (data.conversationHistory) {
+              setConversationHistory(data.conversationHistory);
+            }
+
+            // Check if information gathering phase is complete
+            if (data.isComplete && phase === "gathering") {
+              setProjectInformation(data.projectInformation);
+
+              // Add transition message
+              setMessages((prev) => [
+                ...prev,
+                {
+                  role: "system",
+                  content:
+                    "Information gathering complete. Analysing your project needs...",
+                },
+              ]);
+
+              // Switch to recommendation phase
+              setPhase("recommendation");
+
+              // Automatically trigger the recommendation phase
+              setTimeout(() => {
+                handleRecommendationPhase(data.projectInformation);
+              }, 1000);
+            }
+          }
+        }
+      } catch (error) {
+        console.error("Error sending message:", error);
+        setMessages((prev) => {
+          const newMessages = [...prev];
+          // If there's a streaming message, remove it
+          if (
+            newMessages.length > 0 &&
+            newMessages[newMessages.length - 1].streaming
+          ) {
+            newMessages.pop();
+          }
+          return [
+            ...newMessages,
+            {
+              role: "system",
+              content:
+                "Sorry, there was an error processing your request: " +
+                error.message,
+              error: true,
+            },
+          ];
+        });
+      } finally {
+        setIsLoading(false);
+        setCurrentStreamingMessage("");
+      }
+    },
+    [input, phase, conversationHistory, projectInformation, streamingEnabled]
+  ); // Updated dependencies
+
+  const handleRecommendationPhase = async (projectInfo) => {
+    setIsLoading(true);
+
+    // Add an empty assistant message for streaming if streaming is enabled
+    if (streamingEnabled) {
+      setCurrentStreamingMessage("");
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "", streaming: true },
+      ]);
+    }
+
+    try {
+      if (streamingEnabled) {
+        // Streaming implementation for recommendation phase
         const response = await fetch("/api/tool-recommendation", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            phase,
-            userInput: messageToSend,
-            conversationHistory,
-            projectInformation,
-            streaming: true, // Enable streaming on server-side
+            phase: "recommendation",
+            projectInformation: projectInfo,
+            streaming: true,
           }),
         });
 
@@ -60,7 +293,7 @@ export default function ToolHireChatbot() {
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let fullContent = "";
-        let completeData = null;
+        let streamComplete = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -69,7 +302,7 @@ export default function ToolHireChatbot() {
             break;
           }
 
-          // Process the chunks - each chunk is a JSON string followed by newline
+          // Process the chunks
           const chunkText = decoder.decode(value);
           const chunks = chunkText.split("\n").filter(Boolean);
 
@@ -79,22 +312,38 @@ export default function ToolHireChatbot() {
 
               if (data.error) {
                 // Handle error
-                setMessages((prev) => [
-                  ...prev,
-                  { role: "system", content: data.text, error: true },
-                ]);
+                setMessages((prev) => {
+                  const newMessages = [...prev];
+                  // Replace the streaming message with error message
+                  if (newMessages[newMessages.length - 1].streaming) {
+                    newMessages.pop(); // Remove streaming placeholder
+                  }
+                  return [
+                    ...newMessages,
+                    { role: "system", content: data.text, error: true },
+                  ];
+                });
                 break;
               }
 
               if (!data.done) {
-                // Accumulate content but don't show it yet
+                // Update the streaming message
                 fullContent += data.chunk;
+                setCurrentStreamingMessage(fullContent);
+
+                // Update the last message in the messages array
+                setMessages((prev) => {
+                  const newMessages = [...prev];
+                  if (newMessages[newMessages.length - 1].streaming) {
+                    newMessages[newMessages.length - 1].content = fullContent;
+                  }
+                  return newMessages;
+                });
               } else {
-                // Stream complete, store the final data
-                completeData = data;
+                // Stream complete
+                streamComplete = true;
                 if (data.text) {
-                  // If the final message includes a complete text, use it
-                  fullContent = data.text;
+                  fullContent = data.text; // Use the complete text if provided
                 }
               }
             } catch (error) {
@@ -103,132 +352,48 @@ export default function ToolHireChatbot() {
           }
         }
 
-        // Stream is complete, now display the full message to the user
-        if (completeData && fullContent) {
-          // Add AI response to chat only after stream is complete
+        if (streamComplete) {
+          // Remove the streaming flag
+          setMessages((prev) => {
+            const newMessages = [...prev];
+            if (newMessages[newMessages.length - 1].streaming) {
+              newMessages[newMessages.length - 1].streaming = false;
+            }
+            return newMessages;
+          });
+
+          // Add final message
           setMessages((prev) => [
             ...prev,
-            { role: "assistant", content: fullContent },
+            {
+              role: "system",
+              content:
+                "Thank you for using our DIY Project Tool Advisor! We hope this helps with your project.",
+            },
           ]);
-
-          // Update conversation history
-          if (completeData.conversationHistory) {
-            setConversationHistory(completeData.conversationHistory);
-          }
-
-          // Check if information gathering phase is complete
-          if (completeData.isComplete && phase === "gathering") {
-            setProjectInformation(completeData.projectInformation);
-
-            // Add transition message
-            setMessages((prev) => [
-              ...prev,
-              {
-                role: "system",
-                content:
-                  "Information gathering complete. Analysing your project needs...",
-              },
-            ]);
-
-            // Switch to recommendation phase
-            setPhase("recommendation");
-
-            // Automatically trigger the recommendation phase
-            setTimeout(() => {
-              handleRecommendationPhase(completeData.projectInformation);
-            }, 1000);
-          }
         }
-      } catch (error) {
-        console.error("Error sending message:", error);
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: "system",
-            content:
-              "Sorry, there was an error processing your request: " +
-              error.message,
-            error: true,
+      } else {
+        // Non-streaming implementation (original code)
+        const response = await fetch("/api/tool-recommendation", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
           },
-        ]);
-      } finally {
-        setIsLoading(false);
-      }
-    },
-    [input, phase, conversationHistory, projectInformation]
-  );
+          body: JSON.stringify({
+            phase: "recommendation",
+            projectInformation: projectInfo,
+          }),
+        });
 
-  const handleRecommendationPhase = async (projectInfo) => {
-    setIsLoading(true);
-
-    try {
-      // Stream the recommendation phase response but hide streaming from user
-      const response = await fetch("/api/tool-recommendation", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          phase: "recommendation",
-          projectInformation: projectInfo,
-          streaming: true,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Server responded with status: ${response.status}`);
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let fullContent = "";
-      let streamComplete = false;
-
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          break;
+        if (!response.ok) {
+          throw new Error(`Server responded with status: ${response.status}`);
         }
 
-        // Process the chunks
-        const chunkText = decoder.decode(value);
-        const chunks = chunkText.split("\n").filter(Boolean);
+        const data = await response.json();
 
-        for (const chunk of chunks) {
-          try {
-            const data = JSON.parse(chunk);
-
-            if (data.error) {
-              // Handle error
-              setMessages((prev) => [
-                ...prev,
-                { role: "system", content: data.text, error: true },
-              ]);
-              break;
-            }
-
-            if (!data.done) {
-              // Accumulate content but don't display yet
-              fullContent += data.chunk;
-            } else {
-              // Stream complete
-              streamComplete = true;
-              if (data.text) {
-                fullContent = data.text; // Use the complete text if provided
-              }
-            }
-          } catch (error) {
-            console.error("Error parsing chunk:", error, chunk);
-          }
-        }
-      }
-
-      if (streamComplete && fullContent) {
-        // Only add the message to the UI when stream is complete
         setMessages((prev) => [
           ...prev,
-          { role: "assistant", content: fullContent },
+          { role: "assistant", content: data.text },
         ]);
 
         // Add final message
@@ -243,25 +408,36 @@ export default function ToolHireChatbot() {
       }
     } catch (error) {
       console.error("Error getting recommendations:", error);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "system",
-          content:
-            "Sorry, there was an error generating recommendations: " +
-            error.message,
-          error: true,
-        },
-      ]);
+      setMessages((prev) => {
+        const newMessages = [...prev];
+        // If there's a streaming message, remove it
+        if (
+          newMessages.length > 0 &&
+          newMessages[newMessages.length - 1].streaming
+        ) {
+          newMessages.pop();
+        }
+        return [
+          ...newMessages,
+          {
+            role: "system",
+            content:
+              "Sorry, there was an error generating recommendations: " +
+              error.message,
+            error: true,
+          },
+        ];
+      });
     } finally {
       setIsLoading(false);
+      setCurrentStreamingMessage("");
     }
   };
 
   // Scroll to bottom of messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, currentStreamingMessage]);
 
   // Initial message from assistant when component mounts
   useEffect(() => {
@@ -270,6 +446,11 @@ export default function ToolHireChatbot() {
       setInitialMessageSent(true);
     }
   }, [handleSendMessage, initialMessageSent]);
+
+  // Toggle streaming function
+  const toggleStreaming = () => {
+    setStreamingEnabled(!streamingEnabled);
+  };
 
   // Custom components for ReactMarkdown
   const markdownComponents = {
@@ -337,6 +518,29 @@ export default function ToolHireChatbot() {
     <div className="flex flex-col h-full max-w-5xl mx-auto">
       <div className="bg-[#e26e2a] text-white p-4 text-center">
         <h1 className="text-xl font-bold">DIY Project Tool Advisor</h1>
+        <div className="mt-2 flex justify-center items-center text-sm">
+          <label className="flex items-center cursor-pointer">
+            <span className="mr-2">Streaming responses</span>
+            <div className="relative">
+              <input
+                type="checkbox"
+                className="sr-only"
+                checked={streamingEnabled}
+                onChange={toggleStreaming}
+              />
+              <div
+                className={`block w-10 h-6 rounded-full ${
+                  streamingEnabled ? "bg-green-400" : "bg-gray-400"
+                }`}
+              ></div>
+              <div
+                className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition ${
+                  streamingEnabled ? "transform translate-x-4" : ""
+                }`}
+              ></div>
+            </div>
+          </label>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 bg-gray-100">
@@ -356,13 +560,16 @@ export default function ToolHireChatbot() {
                   : "bg-white text-gray-800 border border-gray-300 max-w-3/4"
               } ${
                 message.error ? "bg-red-100 border-red-300 text-red-800" : ""
-              }`}
+              } ${message.streaming ? "border-green-400 border-2" : ""}`}
             >
               {message.role === "assistant" ? (
                 <div className="markdown-content">
                   <ReactMarkdown components={markdownComponents}>
                     {message.content}
                   </ReactMarkdown>
+                  {message.streaming && (
+                    <span className="inline-block animate-pulse">▌</span>
+                  )}
                 </div>
               ) : (
                 message.content.split("\n").map((line, i) => (
