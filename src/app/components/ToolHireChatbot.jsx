@@ -17,7 +17,7 @@ export default function ToolHireChatbot() {
   const [phase, setPhase] = useState("gathering"); // 'gathering' or 'recommendation'
   const [conversationHistory, setConversationHistory] = useState([]); // Changed from conversationContext to conversationHistory array
   const [projectInformation, setProjectInformation] = useState("");
-  const [streamingEnabled, setStreamingEnabled] = useState(true); // Enable streaming by default
+  const streamingEnabled = true; // Always use streaming responses
   const [currentStreamingMessage, setCurrentStreamingMessage] = useState(""); // State to hold current streaming message
   const messagesEndRef = useRef(null);
   const [initialMessageSent, setInitialMessageSent] = useState(false);
@@ -447,10 +447,7 @@ export default function ToolHireChatbot() {
     }
   }, [handleSendMessage, initialMessageSent]);
 
-  // Toggle streaming function
-  const toggleStreaming = () => {
-    setStreamingEnabled(!streamingEnabled);
-  };
+  // Streaming is always enabled, no toggle function needed
 
   // Custom components for ReactMarkdown
   const markdownComponents = {
@@ -518,29 +515,6 @@ export default function ToolHireChatbot() {
     <div className="flex flex-col h-full max-w-5xl mx-auto">
       <div className="bg-[#e26e2a] text-white p-4 text-center">
         <h1 className="text-xl font-bold">DIY Project Tool Advisor</h1>
-        <div className="mt-2 flex justify-center items-center text-sm">
-          <label className="flex items-center cursor-pointer">
-            <span className="mr-2">Streaming responses</span>
-            <div className="relative">
-              <input
-                type="checkbox"
-                className="sr-only"
-                checked={streamingEnabled}
-                onChange={toggleStreaming}
-              />
-              <div
-                className={`block w-10 h-6 rounded-full ${
-                  streamingEnabled ? "bg-green-400" : "bg-gray-400"
-                }`}
-              ></div>
-              <div
-                className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition ${
-                  streamingEnabled ? "transform translate-x-4" : ""
-                }`}
-              ></div>
-            </div>
-          </label>
-        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 bg-gray-100">
