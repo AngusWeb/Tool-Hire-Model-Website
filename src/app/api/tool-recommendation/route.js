@@ -3,9 +3,6 @@ import { promises as fs } from "fs";
 import path from "path";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-// Add this line here
-export const runtime = "edge";
-
 // API key for Google's Gemini API
 const API_KEY = process.env.API_KEY; // Replace with your actual API key or use environment variables
 
@@ -317,6 +314,7 @@ function initializeGeminiModel(modelName = "gemini-2.0-flash") {
       temperature: 0.7,
       topP: 0.95,
       topK: 64,
+      maxOutputTokens: 1600, // Setting max token output to 1600
     },
   });
 }
