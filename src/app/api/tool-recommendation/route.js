@@ -7,34 +7,61 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 const API_KEY = process.env.API_KEY; // Replace with your actual API key or use environment variables
 
 /**
- * API route handler for Next.js
+ * API route handler for Next.js - handles streaming responses
  * @param {Request} request - The incoming request
- * @returns {Response} - The API response
+ * @returns {Response} - The API response (streaming or regular JSON)
  */
 export async function POST(request) {
   try {
     const body = await request.json();
-    const { phase, userInput, conversationHistory, projectInformation } = body;
+    const {
+      phase,
+      userInput,
+      conversationHistory,
+      projectInformation,
+      streaming = false,
+    } = body;
 
-    if (phase === "gathering") {
-      // Handle the information gathering phase
-      const result = await handleInformationGathering(
-        userInput,
-        conversationHistory
-      );
-      return Response.json(result);
-    } else if (phase === "recommendation") {
-      // Handle the tool recommendation phase
-      const result = await handleToolRecommendation(projectInformation);
-      return Response.json(result);
+    // Check if streaming is requested
+    if (streaming) {
+      // Handle streaming responses
+      if (phase === "gathering") {
+        // Stream information gathering phase response
+        return streamInformationGathering(userInput, conversationHistory);
+      } else if (phase === "recommendation") {
+        // Stream tool recommendation phase response
+        return streamToolRecommendation(projectInformation);
+      } else {
+        return Response.json(
+          {
+            error: true,
+            text: "Invalid phase specified for streaming. Must be 'gathering' or 'recommendation'.",
+          },
+          { status: 400 }
+        );
+      }
     } else {
-      return Response.json(
-        {
-          error: true,
-          text: "Invalid phase specified. Must be 'gathering' or 'recommendation'.",
-        },
-        { status: 400 }
-      );
+      // Handle non-streaming responses (original behavior)
+      if (phase === "gathering") {
+        // Handle the information gathering phase
+        const result = await handleInformationGathering(
+          userInput,
+          conversationHistory
+        );
+        return Response.json(result);
+      } else if (phase === "recommendation") {
+        // Handle the tool recommendation phase
+        const result = await handleToolRecommendation(projectInformation);
+        return Response.json(result);
+      } else {
+        return Response.json(
+          {
+            error: true,
+            text: "Invalid phase specified. Must be 'gathering' or 'recommendation'.",
+          },
+          { status: 400 }
+        );
+      }
     }
   } catch (error) {
     console.error("Error processing request:", error);
@@ -47,6 +74,232 @@ export async function POST(request) {
       { status: 500 }
     );
   }
+}
+
+/**
+ * Stream the information gathering phase response
+ * @param {string} userInput - User's current input
+ * @param {Array} conversationHistory - Previous conversation history, if any
+ * @returns {Response} - A streaming response
+ */
+async function streamInformationGathering(userInput, conversationHistory = []) {
+  const encoder = new TextEncoder();
+  const model = initializeGeminiModel();
+
+  // Create a new ReadableStream
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        // Initialize chat
+        let chat;
+
+        // If this is a new conversation, start with system instructions
+        if (!conversationHistory || conversationHistory.length === 0) {
+          chat = model.startChat();
+          // Send the system prompt but don't stream its response
+          await chat.sendMessage(IMPROVED_PROMPT);
+
+          // Update conversation history locally (not sent back during streaming)
+          conversationHistory = [
+            {
+              role: "user",
+              parts: [{ text: IMPROVED_PROMPT }],
+            },
+            {
+              role: "model",
+              parts: [{ text: "System initialization complete" }],
+            },
+          ];
+        } else {
+          // For existing conversations, use the history
+          chat = model.startChat({
+            history: formatChatHistory(conversationHistory),
+          });
+        }
+
+        // Send the user's message and get a streaming response
+        const streamResult = await model.generateContentStream(userInput);
+
+        // Keep track of the full response for final processing
+        let fullResponseText = "";
+
+        // Stream each chunk as it arrives
+        for await (const chunk of streamResult.stream) {
+          const chunkText = chunk.text();
+          fullResponseText += chunkText;
+
+          // Send this chunk to the client
+          controller.enqueue(
+            encoder.encode(
+              JSON.stringify({
+                chunk: chunkText,
+                done: false,
+              }) + "\n"
+            )
+          );
+        }
+
+        // After streaming completes, determine if this phase is complete
+        const isComplete = fullResponseText.includes("## FINAL SUMMARY ##");
+        let projectInformation = "";
+
+        if (isComplete) {
+          projectInformation = fullResponseText;
+        }
+
+        // Send final message with complete conversation history
+        // Add the current interaction to conversation history
+        conversationHistory.push({
+          role: "user",
+          parts: [{ text: userInput }],
+        });
+
+        conversationHistory.push({
+          role: "model",
+          parts: [{ text: fullResponseText }],
+        });
+
+        // Send the final status
+        controller.enqueue(
+          encoder.encode(
+            JSON.stringify({
+              done: true,
+              conversationHistory: conversationHistory,
+              isComplete: isComplete,
+              projectInformation: projectInformation,
+            }) + "\n"
+          )
+        );
+
+        // Close the stream
+        controller.close();
+      } catch (error) {
+        // Handle errors in the stream
+        controller.enqueue(
+          encoder.encode(
+            JSON.stringify({
+              error: true,
+              text: "Error in streaming response: " + error.message,
+              done: true,
+            }) + "\n"
+          )
+        );
+        controller.close();
+      }
+    },
+  });
+
+  // Return the stream as a response
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      Connection: "keep-alive",
+      "Cache-Control": "no-cache",
+    },
+  });
+}
+
+/**
+ * Stream the tool recommendation phase response
+ * @param {string} projectInformation - The gathered project information
+ * @returns {Response} - A streaming response
+ */
+async function streamToolRecommendation(projectInformation) {
+  const encoder = new TextEncoder();
+
+  // Create a new ReadableStream
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        // Read the tool information from file
+        let toolInformation;
+        let productUrls;
+        try {
+          toolInformation = await readFromFile("tool_information.txt");
+          productUrls = await readFromFile("product_urls.txt");
+        } catch (error) {
+          controller.enqueue(
+            encoder.encode(
+              JSON.stringify({
+                error: true,
+                text: "Error: Unable to access tool information or product URLs. Please try again later.",
+                done: true,
+              }) + "\n"
+            )
+          );
+          controller.close();
+          return;
+        }
+
+        const model = initializeGeminiModel();
+
+        const prompt = PROMPT_TEMPLATE.replace(
+          "{project_information}",
+          projectInformation
+        )
+          .replace("{tool_information}", toolInformation)
+          .replace("{product_urls_file}", productUrls);
+
+        // Send the prompt to Gemini API and get a streaming result
+        const streamResult = await model.generateContentStream(prompt);
+
+        // Keep track of the full response
+        let fullResponseText = "";
+
+        // Stream each chunk as it arrives
+        for await (const chunk of streamResult.stream) {
+          const chunkText = chunk.text();
+          fullResponseText += chunkText;
+
+          // Send this chunk to the client
+          controller.enqueue(
+            encoder.encode(
+              JSON.stringify({
+                chunk: chunkText,
+                done: false,
+              }) + "\n"
+            )
+          );
+        }
+
+        // Send final complete message
+        controller.enqueue(
+          encoder.encode(
+            JSON.stringify({
+              done: true,
+              text: fullResponseText,
+            }) + "\n"
+          )
+        );
+
+        // Close the stream
+        controller.close();
+      } catch (error) {
+        // Handle errors in the stream
+        controller.enqueue(
+          encoder.encode(
+            JSON.stringify({
+              error: true,
+              text: "Error in streaming response: " + error.message,
+              done: true,
+            }) + "\n"
+          )
+        );
+        controller.close();
+      }
+    },
+  });
+
+  // Return the stream as a response
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "application/json",
+      "Transfer-Encoding": "chunked",
+      Connection: "keep-alive",
+      "Cache-Control": "no-cache",
+    },
+  });
 }
 
 /**
@@ -82,7 +335,7 @@ function formatChatHistory(history) {
 }
 
 /**
- * Handle the first phase: information gathering
+ * Handle the first phase: information gathering (non-streaming version)
  * @param {string} userInput - User's current input
  * @param {Array} conversationHistory - Previous conversation history, if any
  * @returns {Object} - Response object with text and conversation history
@@ -149,7 +402,7 @@ async function handleInformationGathering(userInput, conversationHistory = []) {
 }
 
 /**
- * Handle the second phase: tool recommendation
+ * Handle the second phase: tool recommendation (non-streaming version)
  * @param {string} projectInformation - The gathered project information
  * @returns {Object} - Response object with the recommendations
  */
