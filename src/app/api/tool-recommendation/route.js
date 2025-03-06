@@ -648,7 +648,6 @@ Depending on the project type, you might consider asking these additional questi
 - Use your knowledge of our tool categories to suggest appropriate equipment they might not have considered.
 - Provide the final "Customer Project Information" summary when you have gathered sufficient information to make tool recommendations.
 - Clearly mark the final summary with the prefix "## FINAL SUMMARY ##"
-MAKE SURE TO WRITE A 5000WORD RESPONSE
 `;
 
 // The prompt template for the tool recommendation phase
@@ -691,4 +690,5 @@ Tool Information:
 
 Product URLs:
 {product_urls_file}
+MAKE SURE TO WRITE A 5000WORD RESPONSE
 `;
