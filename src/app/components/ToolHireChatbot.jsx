@@ -1168,13 +1168,13 @@ export default function ToolHireChatbot() {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyPress={(e) => e.key === "Enter" && handleSendMessage(input)}
+            onKeyPress={(e) => e.key === "Enter" && handleSendMessage()}
             placeholder="Type your message here..."
             disabled={isLoading || phase === "recommendation"}
             className="flex-1 p-2 border border-gray-300 rounded-l-lg focus:outline-none focus:ring-2 focus:ring-black"
           />
           <button
-            onClick={() => handleSendMessage(input)}
+            onClick={() => handleSendMessage()}
             disabled={isLoading || !input.trim() || phase === "recommendation"}
             className="bg-black hover:bg-black text-white p-2 rounded-r-lg disabled:bg-[#e26e2a]"
           >
