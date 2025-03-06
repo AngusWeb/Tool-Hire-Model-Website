@@ -807,5 +807,4 @@ Tool Information:
 
 Product URLs:
 {product_urls_file}
-MAKE SURE TO WRITE A 5000WORD RESPONSE
 `;
