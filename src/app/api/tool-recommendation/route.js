@@ -20,6 +20,7 @@ export async function POST(request) {
       conversationHistory,
       projectInformation,
       streaming = false,
+      partialResponse = null, // Add parameter to handle partial responses
     } = body;
 
     // Check if streaming is requested
@@ -29,8 +30,8 @@ export async function POST(request) {
         // Stream information gathering phase response
         return streamInformationGathering(userInput, conversationHistory);
       } else if (phase === "recommendation") {
-        // Stream tool recommendation phase response
-        return streamToolRecommendation(projectInformation);
+        // Stream tool recommendation phase response, passing the partial response if any
+        return streamToolRecommendation(projectInformation, partialResponse);
       } else {
         return Response.json(
           {
@@ -50,8 +51,11 @@ export async function POST(request) {
         );
         return Response.json(result);
       } else if (phase === "recommendation") {
-        // Handle the tool recommendation phase
-        const result = await handleToolRecommendation(projectInformation);
+        // Handle the tool recommendation phase, passing the partial response if any
+        const result = await handleToolRecommendation(
+          projectInformation,
+          partialResponse
+        );
         return Response.json(result);
       } else {
         return Response.json(
@@ -203,9 +207,13 @@ async function streamInformationGathering(userInput, conversationHistory = []) {
 /**
  * Stream the tool recommendation phase response
  * @param {string} projectInformation - The gathered project information
+ * @param {Object|null} partialResponse - Partial response data from a previous request
  * @returns {Response} - A streaming response
  */
-async function streamToolRecommendation(projectInformation) {
+async function streamToolRecommendation(
+  projectInformation,
+  partialResponse = null
+) {
   const encoder = new TextEncoder();
 
   // Create a new ReadableStream
@@ -233,24 +241,41 @@ async function streamToolRecommendation(projectInformation) {
         }
 
         const model = initializeGeminiModel();
+        let prompt;
+        let previousOutput = "";
 
-        const prompt = PROMPT_TEMPLATE.replace(
-          "{project_information}",
-          projectInformation
-        )
-          .replace("{tool_information}", toolInformation)
-          .replace("{product_urls_file}", productUrls);
+        if (partialResponse) {
+          // If we have a partial response, use it to continue
+          previousOutput = partialResponse.text || "";
+          // Create a prompt to continue from where we left off
+          prompt = `
+The following is a partially completed response that was cut off due to a timeout.
+Please continue the response from where it was cut off, maintaining the same format and quality.
+
+Partial response:
+${previousOutput}
+
+Continue from where the response was cut off:`;
+        } else {
+          // Initial prompt for a new recommendation
+          prompt = PROMPT_TEMPLATE.replace(
+            "{project_information}",
+            projectInformation
+          )
+            .replace("{tool_information}", toolInformation)
+            .replace("{product_urls_file}", productUrls);
+        }
 
         // Send the prompt to Gemini API and get a streaming result
         const streamResult = await model.generateContentStream(prompt);
 
         // Keep track of the full response
-        let fullResponseText = "";
+        let newResponseText = "";
 
         // Stream each chunk as it arrives
         for await (const chunk of streamResult.stream) {
           const chunkText = chunk.text();
-          fullResponseText += chunkText;
+          newResponseText += chunkText;
 
           // Send this chunk to the client
           controller.enqueue(
@@ -263,12 +288,18 @@ async function streamToolRecommendation(projectInformation) {
           );
         }
 
+        // Combine previous output with new response for continuation cases
+        const fullResponseText = partialResponse
+          ? previousOutput + newResponseText
+          : newResponseText;
+
         // Send final complete message
         controller.enqueue(
           encoder.encode(
             JSON.stringify({
               done: true,
               text: fullResponseText,
+              partialText: newResponseText, // Include the new part separately
             }) + "\n"
           )
         );
@@ -405,9 +436,13 @@ async function handleInformationGathering(userInput, conversationHistory = []) {
 /**
  * Handle the second phase: tool recommendation (non-streaming version)
  * @param {string} projectInformation - The gathered project information
+ * @param {Object|null} partialResponse - Partial response data from a previous request
  * @returns {Object} - Response object with the recommendations
  */
-async function handleToolRecommendation(projectInformation) {
+async function handleToolRecommendation(
+  projectInformation,
+  partialResponse = null
+) {
   // Read the tool information from file
   let toolInformation;
   let productUrls;
@@ -423,23 +458,47 @@ async function handleToolRecommendation(projectInformation) {
   }
 
   const model = initializeGeminiModel();
+  let prompt;
+  let previousOutput = "";
 
-  const prompt = PROMPT_TEMPLATE.replace(
-    "{project_information}",
-    projectInformation
-  )
-    .replace("{tool_information}", toolInformation)
-    .replace("{product_urls_file}", productUrls);
+  if (partialResponse) {
+    // If we have a partial response, use it to continue
+    previousOutput = partialResponse.text || "";
+    // Create a prompt to continue from where we left off
+    prompt = `
+The following is a partially completed response that was cut off due to a timeout.
+Please continue the response from where it was cut off, maintaining the same format and quality.
+
+Partial response:
+${previousOutput}
+
+Continue from where the response was cut off:`;
+  } else {
+    // Initial prompt for a new recommendation
+    prompt = PROMPT_TEMPLATE.replace(
+      "{project_information}",
+      projectInformation
+    )
+      .replace("{tool_information}", toolInformation)
+      .replace("{product_urls_file}", productUrls);
+  }
 
   // Send the prompt to Gemini API using the new SDK
   const result = await model.generateContent(prompt);
-  const resultText = result.response.text();
+  const newResponseText = result.response.text();
+
+  // Combine previous output with new response for continuation cases
+  const fullResponseText = partialResponse
+    ? previousOutput + newResponseText
+    : newResponseText;
 
   return {
-    text: resultText,
+    text: fullResponseText,
+    partialText: newResponseText, // Include the new part separately
     error: false,
   };
 }
+
 /**
  * Helper function to read content from a file
  * @param {string} filename - The name of the file
@@ -454,7 +513,6 @@ async function readFromFile(filename) {
     throw error;
   }
 }
-
 // The improved prompt for the information gathering phase
 const IMPROVED_PROMPT = `
 You are an expert consultant for a tool hire business. Your primary task is to:

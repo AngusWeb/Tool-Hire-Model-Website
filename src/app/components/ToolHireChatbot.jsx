@@ -21,6 +21,9 @@ export default function ToolHireChatbot() {
   const [currentStreamingMessage, setCurrentStreamingMessage] = useState(""); // State to hold current streaming message
   const messagesEndRef = useRef(null);
   const [initialMessageSent, setInitialMessageSent] = useState(false);
+  const [partialResponse, setPartialResponse] = useState(null); // Store partial responses when timeout occurs
+  const abortControllerRef = useRef(null); // To manage fetch request timeouts
+  const timeoutDuration = 9500; // Just under Vercel's 10s limit
 
   // Use useCallback to memoize the handleSendMessage function
   const handleSendMessage = useCallback(
@@ -31,16 +34,26 @@ export default function ToolHireChatbot() {
         return;
       }
 
-      // Add user message to chat
-      setMessages((prev) => [
-        ...prev,
-        { role: "user", content: messageToSend },
-      ]);
+      // If we have a partial response but the user is sending a new message,
+      // ensure we handle the continuation first
+      if (partialResponse && !userMessage) {
+        handleContinueResponse();
+        return;
+      }
+
+      // Add user message to chat only if it's not a continuation
+      if (!partialResponse) {
+        setMessages((prev) => [
+          ...prev,
+          { role: "user", content: messageToSend },
+        ]);
+      }
+
       setIsLoading(true);
       setInput("");
 
       // Add an empty assistant message for streaming if streaming is enabled
-      if (streamingEnabled) {
+      if (streamingEnabled && !partialResponse) {
         setCurrentStreamingMessage("");
         setMessages((prev) => [
           ...prev,
@@ -50,6 +63,22 @@ export default function ToolHireChatbot() {
 
       try {
         if (streamingEnabled) {
+          // Create abort controller for timeout handling
+          const controller = new AbortController();
+          abortControllerRef.current = controller;
+
+          // Set timeout for the request
+          const timeoutId = setTimeout(() => {
+            // Store the partial response before aborting
+            if (currentStreamingMessage) {
+              setPartialResponse({
+                text: currentStreamingMessage,
+                phase: phase,
+              });
+            }
+            controller.abort();
+          }, timeoutDuration);
+
           // Streaming implementation
           const response = await fetch("/api/tool-recommendation", {
             method: "POST",
@@ -61,9 +90,14 @@ export default function ToolHireChatbot() {
               userInput: messageToSend,
               conversationHistory,
               projectInformation,
-              streaming: true, // Request streaming response
+              streaming: true,
+              partialResponse: partialResponse, // Include partial response if exists
             }),
+            signal: controller.signal,
           });
+
+          // Clear the timeout as request completed
+          clearTimeout(timeoutId);
 
           if (!response.ok) {
             throw new Error(`Server responded with status: ${response.status}`);
@@ -71,8 +105,34 @@ export default function ToolHireChatbot() {
 
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
-          let fullContent = "";
+          let fullContent = partialResponse ? partialResponse.text : "";
           let completeData = null;
+
+          // If we're continuing from a partial response, start with that content
+          if (partialResponse) {
+            setCurrentStreamingMessage(fullContent);
+
+            // Replace the last message if it's streaming or add a new one
+            setMessages((prev) => {
+              const newMessages = [...prev];
+              if (
+                newMessages.length > 0 &&
+                newMessages[newMessages.length - 1].role === "assistant" &&
+                newMessages[newMessages.length - 1].streaming
+              ) {
+                // Update existing streaming message
+                newMessages[newMessages.length - 1].content = fullContent;
+              } else {
+                // Add new streaming message
+                newMessages.push({
+                  role: "assistant",
+                  content: fullContent,
+                  streaming: true,
+                });
+              }
+              return newMessages;
+            });
+          }
 
           while (true) {
             const { done, value } = await reader.read();
@@ -130,6 +190,9 @@ export default function ToolHireChatbot() {
 
           // Stream is complete, update with final data
           if (completeData) {
+            // Clear partial response state as we've successfully completed
+            setPartialResponse(null);
+
             // Remove the streaming flag
             setMessages((prev) => {
               const newMessages = [...prev];
@@ -179,6 +242,7 @@ export default function ToolHireChatbot() {
               userInput: messageToSend,
               conversationHistory,
               projectInformation,
+              partialResponse: partialResponse, // Include partial response if exists
             }),
           });
 
@@ -194,6 +258,9 @@ export default function ToolHireChatbot() {
               { role: "system", content: data.text, error: true },
             ]);
           } else {
+            // Clear partial response state
+            setPartialResponse(null);
+
             // Add AI response to chat
             setMessages((prev) => [
               ...prev,
@@ -231,39 +298,93 @@ export default function ToolHireChatbot() {
         }
       } catch (error) {
         console.error("Error sending message:", error);
-        setMessages((prev) => {
-          const newMessages = [...prev];
-          // If there's a streaming message, remove it
-          if (
-            newMessages.length > 0 &&
-            newMessages[newMessages.length - 1].streaming
-          ) {
-            newMessages.pop();
-          }
-          return [
-            ...newMessages,
-            {
-              role: "system",
-              content:
-                "Sorry, there was an error processing your request: " +
-                error.message,
-              error: true,
-            },
-          ];
-        });
+
+        // Check if this is an AbortError (timeout)
+        if (error.name === "AbortError") {
+          // Add message to show the user we're continuing due to timeout
+          setMessages((prev) => {
+            const newMessages = [...prev];
+            // Don't remove streaming message as we'll continue from it
+            return [
+              ...newMessages,
+              {
+                role: "system",
+                content:
+                  "The response was cut off due to a timeout. Continuing...",
+                timeout: true,
+              },
+            ];
+          });
+
+          // Auto-continue after a brief delay
+          setTimeout(() => {
+            handleContinueResponse();
+          }, 1000);
+        } else {
+          // Handle other errors
+          setMessages((prev) => {
+            const newMessages = [...prev];
+            // If there's a streaming message, remove it
+            if (
+              newMessages.length > 0 &&
+              newMessages[newMessages.length - 1].streaming
+            ) {
+              newMessages.pop();
+            }
+            return [
+              ...newMessages,
+              {
+                role: "system",
+                content:
+                  "Sorry, there was an error processing your request: " +
+                  error.message,
+                error: true,
+              },
+            ];
+          });
+        }
       } finally {
         setIsLoading(false);
-        setCurrentStreamingMessage("");
+        if (!partialResponse) {
+          setCurrentStreamingMessage("");
+        }
       }
     },
-    [input, phase, conversationHistory, projectInformation, streamingEnabled]
+    [
+      input,
+      phase,
+      conversationHistory,
+      projectInformation,
+      streamingEnabled,
+      partialResponse,
+      currentStreamingMessage,
+    ]
   ); // Updated dependencies
 
-  const handleRecommendationPhase = async (projectInfo) => {
+  // Function to handle continuing a response after timeout
+  const handleContinueResponse = useCallback(() => {
+    if (!partialResponse) return;
+
+    // Set loading state but keep the partial message visible
+    setIsLoading(true);
+
+    // Call appropriate handler based on phase
+    if (partialResponse.phase === "gathering") {
+      handleSendMessage(""); // Empty string tells the function we're continuing
+    } else {
+      handleRecommendationPhase(projectInformation, true); // true indicates continuation
+    }
+  }, [partialResponse, projectInformation, handleSendMessage]);
+
+  const handleRecommendationPhase = async (
+    projectInfo,
+    isContinuation = false
+  ) => {
     setIsLoading(true);
 
     // Add an empty assistant message for streaming if streaming is enabled
-    if (streamingEnabled) {
+    // and this is not a continuation of a partial response
+    if (streamingEnabled && !isContinuation && !partialResponse) {
       setCurrentStreamingMessage("");
       setMessages((prev) => [
         ...prev,
@@ -273,6 +394,22 @@ export default function ToolHireChatbot() {
 
     try {
       if (streamingEnabled) {
+        // Create abort controller for timeout handling
+        const controller = new AbortController();
+        abortControllerRef.current = controller;
+
+        // Set timeout for the request
+        const timeoutId = setTimeout(() => {
+          // Store the partial response before aborting
+          if (currentStreamingMessage) {
+            setPartialResponse({
+              text: currentStreamingMessage,
+              phase: "recommendation",
+            });
+          }
+          controller.abort();
+        }, timeoutDuration);
+
         // Streaming implementation for recommendation phase
         const response = await fetch("/api/tool-recommendation", {
           method: "POST",
@@ -283,8 +420,16 @@ export default function ToolHireChatbot() {
             phase: "recommendation",
             projectInformation: projectInfo,
             streaming: true,
+            partialResponse:
+              partialResponse && partialResponse.phase === "recommendation"
+                ? partialResponse
+                : null,
           }),
+          signal: controller.signal,
         });
+
+        // Clear the timeout as request completed
+        clearTimeout(timeoutId);
 
         if (!response.ok) {
           throw new Error(`Server responded with status: ${response.status}`);
@@ -292,8 +437,37 @@ export default function ToolHireChatbot() {
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        let fullContent = "";
+        let fullContent =
+          partialResponse && partialResponse.phase === "recommendation"
+            ? partialResponse.text
+            : "";
         let streamComplete = false;
+
+        // If we're continuing from a partial response, start with that content
+        if (partialResponse && partialResponse.phase === "recommendation") {
+          setCurrentStreamingMessage(fullContent);
+
+          // Update the last message if it's streaming or add a new one
+          setMessages((prev) => {
+            const newMessages = [...prev];
+            if (
+              newMessages.length > 0 &&
+              newMessages[newMessages.length - 1].role === "assistant" &&
+              newMessages[newMessages.length - 1].streaming
+            ) {
+              // Update existing streaming message
+              newMessages[newMessages.length - 1].content = fullContent;
+            } else {
+              // Add new streaming message
+              newMessages.push({
+                role: "assistant",
+                content: fullContent,
+                streaming: true,
+              });
+            }
+            return newMessages;
+          });
+        }
 
         while (true) {
           const { done, value } = await reader.read();
@@ -353,6 +527,9 @@ export default function ToolHireChatbot() {
         }
 
         if (streamComplete) {
+          // Clear partial response state as we've successfully completed
+          setPartialResponse(null);
+
           // Remove the streaming flag
           setMessages((prev) => {
             const newMessages = [...prev];
@@ -382,6 +559,10 @@ export default function ToolHireChatbot() {
           body: JSON.stringify({
             phase: "recommendation",
             projectInformation: projectInfo,
+            partialResponse:
+              partialResponse && partialResponse.phase === "recommendation"
+                ? partialResponse
+                : null,
           }),
         });
 
@@ -390,6 +571,9 @@ export default function ToolHireChatbot() {
         }
 
         const data = await response.json();
+
+        // Clear partial response state
+        setPartialResponse(null);
 
         setMessages((prev) => [
           ...prev,
@@ -408,29 +592,56 @@ export default function ToolHireChatbot() {
       }
     } catch (error) {
       console.error("Error getting recommendations:", error);
-      setMessages((prev) => {
-        const newMessages = [...prev];
-        // If there's a streaming message, remove it
-        if (
-          newMessages.length > 0 &&
-          newMessages[newMessages.length - 1].streaming
-        ) {
-          newMessages.pop();
-        }
-        return [
-          ...newMessages,
-          {
-            role: "system",
-            content:
-              "Sorry, there was an error generating recommendations: " +
-              error.message,
-            error: true,
-          },
-        ];
-      });
+
+      // Check if this is an AbortError (timeout)
+      if (error.name === "AbortError") {
+        // Add message to show the user we're continuing due to timeout
+        setMessages((prev) => {
+          const newMessages = [...prev];
+          // Don't remove streaming message as we'll continue from it
+          return [
+            ...newMessages,
+            {
+              role: "system",
+              content:
+                "The response was cut off due to a timeout. Continuing...",
+              timeout: true,
+            },
+          ];
+        });
+
+        // Auto-continue after a brief delay
+        setTimeout(() => {
+          handleContinueResponse();
+        }, 1000);
+      } else {
+        // Handle other errors
+        setMessages((prev) => {
+          const newMessages = [...prev];
+          // If there's a streaming message, remove it
+          if (
+            newMessages.length > 0 &&
+            newMessages[newMessages.length - 1].streaming
+          ) {
+            newMessages.pop();
+          }
+          return [
+            ...newMessages,
+            {
+              role: "system",
+              content:
+                "Sorry, there was an error generating recommendations: " +
+                error.message,
+              error: true,
+            },
+          ];
+        });
+      }
     } finally {
       setIsLoading(false);
-      setCurrentStreamingMessage("");
+      if (!partialResponse) {
+        setCurrentStreamingMessage("");
+      }
     }
   };
 
@@ -447,7 +658,14 @@ export default function ToolHireChatbot() {
     }
   }, [handleSendMessage, initialMessageSent]);
 
-  // Streaming is always enabled, no toggle function needed
+  // Cleanup abort controller on unmount
+  useEffect(() => {
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
 
   // Custom components for ReactMarkdown
   const markdownComponents = {
@@ -530,7 +748,9 @@ export default function ToolHireChatbot() {
                 message.role === "user"
                   ? "bg-black text-white max-w-3/4"
                   : message.role === "system"
-                  ? "bg-gray-300 text-gray-800 mx-auto text-center w-full"
+                  ? message.timeout
+                    ? "bg-yellow-100 text-yellow-800 border-yellow-300 border mx-auto text-center w-full"
+                    : "bg-gray-300 text-gray-800 mx-auto text-center w-full"
                   : "bg-white text-gray-800 border border-gray-300 max-w-3/4"
               } ${
                 message.error ? "bg-red-100 border-red-300 text-red-800" : ""
@@ -565,16 +785,31 @@ export default function ToolHireChatbot() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyPress={(e) => e.key === "Enter" && handleSendMessage(input)}
-            placeholder="Type your message here..."
-            disabled={isLoading || phase === "recommendation"}
+            placeholder={
+              partialResponse
+                ? "Continuing previous response..."
+                : "Type your message here..."
+            }
+            disabled={
+              isLoading ||
+              phase === "recommendation" ||
+              partialResponse !== null
+            }
             className="flex-1 p-2 border border-gray-300 rounded-l-lg focus:outline-none focus:ring-2 focus:ring-black"
           />
           <button
-            onClick={() => handleSendMessage(input)}
-            disabled={isLoading || !input.trim() || phase === "recommendation"}
+            onClick={() =>
+              partialResponse
+                ? handleContinueResponse()
+                : handleSendMessage(input)
+            }
+            disabled={
+              (isLoading || !input.trim() || phase === "recommendation") &&
+              !partialResponse
+            }
             className="bg-black hover:bg-black text-white p-2 rounded-r-lg disabled:bg-[#e26e2a]"
           >
-            {isLoading ? "Loading..." : "Send"}
+            {isLoading ? "Loading..." : partialResponse ? "Continue" : "Send"}
           </button>
         </div>
       </div>
