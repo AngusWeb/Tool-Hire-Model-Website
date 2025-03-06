@@ -20,7 +20,8 @@ export async function POST(request) {
       conversationHistory,
       projectInformation,
       streaming = false,
-      partialResponse = null, // Add parameter to handle partial responses
+      continuationMode = false,
+      partialResponse = "",
     } = body;
 
     // Check if streaming is requested
@@ -28,10 +29,19 @@ export async function POST(request) {
       // Handle streaming responses
       if (phase === "gathering") {
         // Stream information gathering phase response
-        return streamInformationGathering(userInput, conversationHistory);
+        return streamInformationGathering(
+          userInput,
+          conversationHistory,
+          continuationMode,
+          partialResponse
+        );
       } else if (phase === "recommendation") {
-        // Stream tool recommendation phase response, passing the partial response if any
-        return streamToolRecommendation(projectInformation, partialResponse);
+        // Stream tool recommendation phase response
+        return streamToolRecommendation(
+          projectInformation,
+          continuationMode,
+          partialResponse
+        );
       } else {
         return Response.json(
           {
@@ -47,13 +57,16 @@ export async function POST(request) {
         // Handle the information gathering phase
         const result = await handleInformationGathering(
           userInput,
-          conversationHistory
+          conversationHistory,
+          continuationMode,
+          partialResponse
         );
         return Response.json(result);
       } else if (phase === "recommendation") {
-        // Handle the tool recommendation phase, passing the partial response if any
+        // Handle the tool recommendation phase
         const result = await handleToolRecommendation(
           projectInformation,
+          continuationMode,
           partialResponse
         );
         return Response.json(result);
@@ -84,9 +97,16 @@ export async function POST(request) {
  * Stream the information gathering phase response
  * @param {string} userInput - User's current input
  * @param {Array} conversationHistory - Previous conversation history, if any
+ * @param {boolean} continuationMode - Whether this is continuing a cut-off response
+ * @param {string} partialResponse - The partial response that was cut off
  * @returns {Response} - A streaming response
  */
-async function streamInformationGathering(userInput, conversationHistory = []) {
+async function streamInformationGathering(
+  userInput,
+  conversationHistory = [],
+  continuationMode = false,
+  partialResponse = ""
+) {
   const encoder = new TextEncoder();
   const model = initializeGeminiModel();
 
@@ -97,83 +117,154 @@ async function streamInformationGathering(userInput, conversationHistory = []) {
         // Initialize chat
         let chat;
 
-        // If this is a new conversation, start with system instructions
-        if (!conversationHistory || conversationHistory.length === 0) {
-          chat = model.startChat();
-          // Send the system prompt but don't stream its response
-          await chat.sendMessage(IMPROVED_PROMPT);
+        if (continuationMode && partialResponse) {
+          // For continuation mode, we'll include the partial response in the prompt
+          const continuationPrompt = `The previous response was cut off. Here was the partial response: "${partialResponse}". Please continue from where you left off.`;
 
-          // Update conversation history locally (not sent back during streaming)
-          conversationHistory = [
-            {
-              role: "user",
-              parts: [{ text: IMPROVED_PROMPT }],
-            },
-            {
-              role: "model",
-              parts: [{ text: "System initialization complete" }],
-            },
-          ];
-        } else {
-          // For existing conversations, use the history
+          // We use the history but we'll directly ask for continuation
           chat = model.startChat({
             history: formatChatHistory(conversationHistory),
           });
-        }
 
-        // Send the user's message and get a streaming response
-        const streamResult = await model.generateContentStream(userInput);
+          // Send the continuation request
+          const streamResult = await chat.sendMessageStream(continuationPrompt);
 
-        // Keep track of the full response for final processing
-        let fullResponseText = "";
+          // Keep track of the full response for final processing
+          let continuationResponseText = "";
 
-        // Stream each chunk as it arrives
-        for await (const chunk of streamResult.stream) {
-          const chunkText = chunk.text();
-          fullResponseText += chunkText;
+          // Stream each chunk as it arrives
+          for await (const chunk of streamResult.stream) {
+            const chunkText = chunk.text();
+            continuationResponseText += chunkText;
 
-          // Send this chunk to the client
+            // Send this chunk to the client
+            controller.enqueue(
+              encoder.encode(
+                JSON.stringify({
+                  chunk: chunkText,
+                  done: false,
+                  continuation: true,
+                }) + "\n"
+              )
+            );
+          }
+
+          // Combine the partial and continuation response
+          const fullResponseText = partialResponse + continuationResponseText;
+
+          // Check if the combined response is complete
+          const isComplete = fullResponseText.includes("## FINAL SUMMARY ##");
+          let projectInformation = "";
+
+          if (isComplete) {
+            projectInformation = fullResponseText;
+          }
+
+          // Update conversation history with the complete response
+          // Remove the last model response if it was partial
+          if (
+            conversationHistory.length > 0 &&
+            conversationHistory[conversationHistory.length - 1].role === "model"
+          ) {
+            conversationHistory.pop();
+          }
+
+          conversationHistory.push({
+            role: "model",
+            parts: [{ text: fullResponseText }],
+          });
+
+          // Send the final status
           controller.enqueue(
             encoder.encode(
               JSON.stringify({
-                chunk: chunkText,
-                done: false,
+                done: true,
+                conversationHistory: conversationHistory,
+                isComplete: isComplete,
+                projectInformation: projectInformation,
+                continuation: true,
+                fullResponse: fullResponseText,
+              }) + "\n"
+            )
+          );
+        } else {
+          // If this is a new conversation, start with system instructions
+          if (!conversationHistory || conversationHistory.length === 0) {
+            chat = model.startChat();
+            // Send the system prompt but don't stream its response
+            await chat.sendMessage(IMPROVED_PROMPT);
+
+            // Update conversation history locally (not sent back during streaming)
+            conversationHistory = [
+              {
+                role: "user",
+                parts: [{ text: IMPROVED_PROMPT }],
+              },
+              {
+                role: "model",
+                parts: [{ text: "System initialization complete" }],
+              },
+            ];
+          } else {
+            // For existing conversations, use the history
+            chat = model.startChat({
+              history: formatChatHistory(conversationHistory),
+            });
+          }
+
+          // Send the user's message and get a streaming response
+          const streamResult = await chat.sendMessageStream(userInput);
+
+          // Keep track of the full response for final processing
+          let fullResponseText = "";
+
+          // Stream each chunk as it arrives
+          for await (const chunk of streamResult.stream) {
+            const chunkText = chunk.text();
+            fullResponseText += chunkText;
+
+            // Send this chunk to the client
+            controller.enqueue(
+              encoder.encode(
+                JSON.stringify({
+                  chunk: chunkText,
+                  done: false,
+                }) + "\n"
+              )
+            );
+          }
+
+          // After streaming completes, determine if this phase is complete
+          const isComplete = fullResponseText.includes("## FINAL SUMMARY ##");
+          let projectInformation = "";
+
+          if (isComplete) {
+            projectInformation = fullResponseText;
+          }
+
+          // Add the current interaction to conversation history
+          conversationHistory.push({
+            role: "user",
+            parts: [{ text: userInput }],
+          });
+
+          conversationHistory.push({
+            role: "model",
+            parts: [{ text: fullResponseText }],
+          });
+
+          // Send the final status
+          controller.enqueue(
+            encoder.encode(
+              JSON.stringify({
+                done: true,
+                conversationHistory: conversationHistory,
+                isComplete: isComplete,
+                projectInformation: projectInformation,
               }) + "\n"
             )
           );
         }
-
-        // After streaming completes, determine if this phase is complete
-        const isComplete = fullResponseText.includes("## FINAL SUMMARY ##");
-        let projectInformation = "";
-
-        if (isComplete) {
-          projectInformation = fullResponseText;
-        }
-
-        // Send final message with complete conversation history
-        // Add the current interaction to conversation history
-        conversationHistory.push({
-          role: "user",
-          parts: [{ text: userInput }],
-        });
-
-        conversationHistory.push({
-          role: "model",
-          parts: [{ text: fullResponseText }],
-        });
-
-        // Send the final status
-        controller.enqueue(
-          encoder.encode(
-            JSON.stringify({
-              done: true,
-              conversationHistory: conversationHistory,
-              isComplete: isComplete,
-              projectInformation: projectInformation,
-            }) + "\n"
-          )
-        );
 
         // Close the stream
         controller.close();
@@ -207,12 +298,14 @@ async function streamInformationGathering(userInput, conversationHistory = []) {
 /**
  * Stream the tool recommendation phase response
  * @param {string} projectInformation - The gathered project information
- * @param {Object|null} partialResponse - Partial response data from a previous request
+ * @param {boolean} continuationMode - Whether this is continuing a cut-off response
+ * @param {string} partialResponse - The partial response that was cut off
  * @returns {Response} - A streaming response
  */
 async function streamToolRecommendation(
   projectInformation,
-  partialResponse = null
+  continuationMode = false,
+  partialResponse = ""
 ) {
   const encoder = new TextEncoder();
 
@@ -241,41 +334,34 @@ async function streamToolRecommendation(
         }
 
         const model = initializeGeminiModel();
-        let prompt;
-        let previousOutput = "";
+        let streamResult;
 
-        if (partialResponse) {
-          // If we have a partial response, use it to continue
-          previousOutput = partialResponse.text || "";
-          // Create a prompt to continue from where we left off
-          prompt = `
-The following is a partially completed response that was cut off due to a timeout.
-Please continue the response from where it was cut off, maintaining the same format and quality.
+        if (continuationMode && partialResponse) {
+          // For continuation mode, we'll ask the model to continue from where it left off
+          const continuationPrompt = `The previous response was cut off. Here was the partial response: "${partialResponse}". Please continue from where you left off without repeating any content.`;
 
-Partial response:
-${previousOutput}
-
-Continue from where the response was cut off:`;
+          // Send the continuation prompt to Gemini API and get a streaming result
+          streamResult = await model.generateContentStream(continuationPrompt);
         } else {
-          // Initial prompt for a new recommendation
-          prompt = PROMPT_TEMPLATE.replace(
+          // Normal mode - generate the initial response
+          const prompt = PROMPT_TEMPLATE.replace(
             "{project_information}",
             projectInformation
           )
             .replace("{tool_information}", toolInformation)
             .replace("{product_urls_file}", productUrls);
+
+          // Send the prompt to Gemini API and get a streaming result
+          streamResult = await model.generateContentStream(prompt);
         }
 
-        // Send the prompt to Gemini API and get a streaming result
-        const streamResult = await model.generateContentStream(prompt);
-
         // Keep track of the full response
-        let newResponseText = "";
+        let responseText = continuationMode ? partialResponse : "";
 
         // Stream each chunk as it arrives
         for await (const chunk of streamResult.stream) {
           const chunkText = chunk.text();
-          newResponseText += chunkText;
+          responseText += chunkText;
 
           // Send this chunk to the client
           controller.enqueue(
@@ -283,23 +369,19 @@ Continue from where the response was cut off:`;
               JSON.stringify({
                 chunk: chunkText,
                 done: false,
+                continuation: continuationMode,
               }) + "\n"
             )
           );
         }
-
-        // Combine previous output with new response for continuation cases
-        const fullResponseText = partialResponse
-          ? previousOutput + newResponseText
-          : newResponseText;
 
         // Send final complete message
         controller.enqueue(
           encoder.encode(
             JSON.stringify({
               done: true,
-              text: fullResponseText,
-              partialText: newResponseText, // Include the new part separately
+              text: responseText,
+              continuation: continuationMode,
             }) + "\n"
           )
         );
@@ -345,7 +427,7 @@ function initializeGeminiModel(modelName = "gemini-2.0-flash") {
       temperature: 0.7,
       topP: 0.95,
       topK: 64,
-      // Setting max token output to 1600
+      maxOutputTokens: 3000, // Setting max token output to 1600
     },
   });
 }
@@ -370,52 +452,91 @@ function formatChatHistory(history) {
  * Handle the first phase: information gathering (non-streaming version)
  * @param {string} userInput - User's current input
  * @param {Array} conversationHistory - Previous conversation history, if any
+ * @param {boolean} continuationMode - Whether this is continuing a cut-off response
+ * @param {string} partialResponse - The partial response that was cut off
  * @returns {Object} - Response object with text and conversation history
  */
-async function handleInformationGathering(userInput, conversationHistory = []) {
+async function handleInformationGathering(
+  userInput,
+  conversationHistory = [],
+  continuationMode = false,
+  partialResponse = ""
+) {
   const model = initializeGeminiModel();
 
   // Initialize chat
   let chat;
+  let aiOutput;
 
-  // If this is a new conversation, start with system instructions
-  if (!conversationHistory || conversationHistory.length === 0) {
-    // First message is always the system prompt
-    chat = model.startChat();
-    const systemResponse = await chat.sendMessage(IMPROVED_PROMPT);
+  if (continuationMode && partialResponse) {
+    // For continuation mode, we'll include the partial response in the prompt
+    const continuationPrompt = `The previous response was cut off. Here was the partial response: "${partialResponse}". Please continue from where you left off.`;
 
-    // Initialize conversation history
-    conversationHistory = [
-      {
-        role: "user",
-        parts: [{ text: IMPROVED_PROMPT }],
-      },
-      {
-        role: "model",
-        parts: [{ text: systemResponse.response.text() }],
-      },
-    ];
-  } else {
-    // For existing conversations, use the history
+    // We use the history but we'll directly ask for continuation
     chat = model.startChat({
       history: formatChatHistory(conversationHistory),
     });
+
+    // Send the continuation request
+    const result = await chat.sendMessage(continuationPrompt);
+    const continuationOutput = result.response.text();
+
+    // Combine the partial and continuation response
+    aiOutput = partialResponse + continuationOutput;
+
+    // Update conversation history with the complete response
+    // Remove the last model response if it was partial
+    if (
+      conversationHistory.length > 0 &&
+      conversationHistory[conversationHistory.length - 1].role === "model"
+    ) {
+      conversationHistory.pop();
+    }
+
+    conversationHistory.push({
+      role: "model",
+      parts: [{ text: aiOutput }],
+    });
+  } else {
+    // If this is a new conversation, start with system instructions
+    if (!conversationHistory || conversationHistory.length === 0) {
+      // First message is always the system prompt
+      chat = model.startChat();
+      const systemResponse = await chat.sendMessage(IMPROVED_PROMPT);
+
+      // Initialize conversation history
+      conversationHistory = [
+        {
+          role: "user",
+          parts: [{ text: IMPROVED_PROMPT }],
+        },
+        {
+          role: "model",
+          parts: [{ text: systemResponse.response.text() }],
+        },
+      ];
+    } else {
+      // For existing conversations, use the history
+      chat = model.startChat({
+        history: formatChatHistory(conversationHistory),
+      });
+    }
+
+    // Send the user's message
+    const result = await chat.sendMessage(userInput);
+    aiOutput = result.response.text();
+
+    // Add the current interaction to conversation history
+    conversationHistory.push({
+      role: "user",
+      parts: [{ text: userInput }],
+    });
+
+    conversationHistory.push({
+      role: "model",
+      parts: [{ text: aiOutput }],
+    });
   }
-
-  // Send the user's message
-  const result = await chat.sendMessage(userInput);
-  const aiOutput = result.response.text();
-
-  // Add the current interaction to conversation history
-  conversationHistory.push({
-    role: "user",
-    parts: [{ text: userInput }],
-  });
-
-  conversationHistory.push({
-    role: "model",
-    parts: [{ text: aiOutput }],
-  });
 
   // Check if the information gathering phase is complete
   const isComplete = aiOutput.includes("## FINAL SUMMARY ##");
@@ -430,18 +551,21 @@ async function handleInformationGathering(userInput, conversationHistory = []) {
     conversationHistory: conversationHistory,
     isComplete: isComplete,
     projectInformation: projectInformation,
+    continuation: continuationMode,
   };
 }
 
 /**
  * Handle the second phase: tool recommendation (non-streaming version)
  * @param {string} projectInformation - The gathered project information
- * @param {Object|null} partialResponse - Partial response data from a previous request
+ * @param {boolean} continuationMode - Whether this is continuing a cut-off response
+ * @param {string} partialResponse - The partial response that was cut off
  * @returns {Object} - Response object with the recommendations
  */
 async function handleToolRecommendation(
   projectInformation,
-  partialResponse = null
+  continuationMode = false,
+  partialResponse = ""
 ) {
   // Read the tool information from file
   let toolInformation;
@@ -458,44 +582,37 @@ async function handleToolRecommendation(
   }
 
   const model = initializeGeminiModel();
-  let prompt;
-  let previousOutput = "";
+  let result;
+  let resultText;
 
-  if (partialResponse) {
-    // If we have a partial response, use it to continue
-    previousOutput = partialResponse.text || "";
-    // Create a prompt to continue from where we left off
-    prompt = `
-The following is a partially completed response that was cut off due to a timeout.
-Please continue the response from where it was cut off, maintaining the same format and quality.
+  if (continuationMode && partialResponse) {
+    // For continuation mode, we'll ask the model to continue from where it left off
+    const continuationPrompt = `The previous response was cut off. Here was the partial response: "${partialResponse}". Please continue from where you left off without repeating any content.`;
 
-Partial response:
-${previousOutput}
+    // Send the continuation prompt to Gemini API
+    result = await model.generateContent(continuationPrompt);
+    const continuationText = result.response.text();
 
-Continue from where the response was cut off:`;
+    // Combine the partial and continuation response
+    resultText = partialResponse + continuationText;
   } else {
-    // Initial prompt for a new recommendation
-    prompt = PROMPT_TEMPLATE.replace(
+    // Normal mode - generate the initial response
+    const prompt = PROMPT_TEMPLATE.replace(
       "{project_information}",
       projectInformation
     )
       .replace("{tool_information}", toolInformation)
       .replace("{product_urls_file}", productUrls);
+
+    // Send the prompt to Gemini API
+    result = await model.generateContent(prompt);
+    resultText = result.response.text();
   }
 
-  // Send the prompt to Gemini API using the new SDK
-  const result = await model.generateContent(prompt);
-  const newResponseText = result.response.text();
-
-  // Combine previous output with new response for continuation cases
-  const fullResponseText = partialResponse
-    ? previousOutput + newResponseText
-    : newResponseText;
-
   return {
-    text: fullResponseText,
-    partialText: newResponseText, // Include the new part separately
+    text: resultText,
     error: false,
+    continuation: continuationMode,
   };
 }
 

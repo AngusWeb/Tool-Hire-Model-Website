@@ -1,9 +1,10 @@
 // File: app/api/tool-recommendation/route.js
 import { promises as fs } from "fs";
 import path from "path";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 // API key for Google's Gemini API
-const API_KEY = "";
+const API_KEY = process.env.API_KEY; // Replace with your actual API key or use environment variables
 
 /**
  * API route handler for Next.js
@@ -13,13 +14,13 @@ const API_KEY = "";
 export async function POST(request) {
   try {
     const body = await request.json();
-    const { phase, userInput, conversationContext, projectInformation } = body;
+    const { phase, userInput, conversationHistory, projectInformation } = body;
 
     if (phase === "gathering") {
       // Handle the information gathering phase
       const result = await handleInformationGathering(
         userInput,
-        conversationContext
+        conversationHistory
       );
       return Response.json(result);
     } else if (phase === "recommendation") {
@@ -40,7 +41,8 @@ export async function POST(request) {
     return Response.json(
       {
         error: true,
-        text: "An error occurred while processing your request.",
+        text:
+          "An error occurred while processing your request: " + error.message,
       },
       { status: 500 }
     );
@@ -48,47 +50,99 @@ export async function POST(request) {
 }
 
 /**
- * Handle the first phase: information gathering
- * @param {string} userInput - User's initial input
- * @param {string} conversationContext - Previous conversation context, if any
- * @returns {Object} - Response object with text and conversation context
+ * Initialize the Google Generative AI client
+ * @returns {Object} - The initialized Gemini model
  */
-async function handleInformationGathering(userInput, conversationContext) {
-  // If this is a new conversation, initialize the context with the improved prompt
-  if (!conversationContext) {
-    conversationContext = "System:\n" + IMPROVED_PROMPT + "\n\n";
-    conversationContext += `User: ${
-      userInput || "Hello! I'd like to discuss my project."
-    }\n`;
-  } else {
-    // Otherwise, append the new user input to the existing conversation
-    conversationContext += `\nUser: ${userInput}\n`;
+function initializeGeminiModel(modelName = "gemini-2.0-flash") {
+  const genAI = new GoogleGenerativeAI(API_KEY);
+  return genAI.getGenerativeModel({
+    model: modelName,
+    generationConfig: {
+      temperature: 0.7,
+      topP: 0.95,
+      topK: 64,
+    },
+  });
+}
+
+/**
+ * Convert conversation history to proper format for the chat
+ * @param {Array} history - The conversation history array
+ * @returns {Array} - Properly formatted history for the API
+ */
+function formatChatHistory(history) {
+  if (!history || history.length === 0) {
+    return [];
   }
 
-  // Send the conversation to Gemini API
-  const response = await fetchGeminiResponse(
-    conversationContext,
-    "gemini-2.0-flash"
-  );
-  const aiOutput = response.text;
+  return history.map((msg) => ({
+    role: msg.role,
+    parts: [{ text: msg.parts[0].text }],
+  }));
+}
+
+/**
+ * Handle the first phase: information gathering
+ * @param {string} userInput - User's current input
+ * @param {Array} conversationHistory - Previous conversation history, if any
+ * @returns {Object} - Response object with text and conversation history
+ */
+async function handleInformationGathering(userInput, conversationHistory = []) {
+  const model = initializeGeminiModel();
+
+  // Initialize chat
+  let chat;
+
+  // If this is a new conversation, start with system instructions
+  if (!conversationHistory || conversationHistory.length === 0) {
+    // First message is always the system prompt
+    chat = model.startChat();
+    const systemResponse = await chat.sendMessage(IMPROVED_PROMPT);
+
+    // Initialize conversation history
+    conversationHistory = [
+      {
+        role: "user",
+        parts: [{ text: IMPROVED_PROMPT }],
+      },
+      {
+        role: "model",
+        parts: [{ text: systemResponse.response.text() }],
+      },
+    ];
+  } else {
+    // For existing conversations, use the history
+    chat = model.startChat({
+      history: formatChatHistory(conversationHistory),
+    });
+  }
+
+  // Send the user's message
+  const result = await chat.sendMessage(userInput);
+  const aiOutput = result.response.text();
+
+  // Add the current interaction to conversation history
+  conversationHistory.push({
+    role: "user",
+    parts: [{ text: userInput }],
+  });
+
+  conversationHistory.push({
+    role: "model",
+    parts: [{ text: aiOutput }],
+  });
 
   // Check if the information gathering phase is complete
-  const isComplete = aiOutput.includes("FINAL SUMMARY");
+  const isComplete = aiOutput.includes("## FINAL SUMMARY ##");
   let projectInformation = "";
 
   if (isComplete) {
     projectInformation = aiOutput;
-    // In a real app, you might want to save this to a database instead of a file
-    // Commented out file operations which might cause issues in serverless environments
-    // await saveToFile("project_information.txt", projectInformation);
   }
-
-  // Add the AI response to the conversation context for future reference
-  conversationContext += `\nAI: ${aiOutput}\n`;
 
   return {
     text: aiOutput,
-    conversationContext: conversationContext,
+    conversationHistory: conversationHistory,
     isComplete: isComplete,
     projectInformation: projectInformation,
   };
@@ -102,77 +156,36 @@ async function handleInformationGathering(userInput, conversationContext) {
 async function handleToolRecommendation(projectInformation) {
   // Read the tool information from file
   let toolInformation;
+  let productUrls;
   try {
     toolInformation = await readFromFile("tool_information.txt");
+    productUrls = await readFromFile("product_urls.txt");
   } catch (error) {
-    console.error("Error reading tool information:", error);
+    console.error("Error reading information files:", error);
     return {
-      text: "Error: Unable to access tool information. Please try again later.",
+      text: "Error: Unable to access tool information or product URLs. Please try again later.",
       error: true,
     };
   }
 
-  // Create the prompt for tool recommendations
+  const model = initializeGeminiModel();
+
   const prompt = PROMPT_TEMPLATE.replace(
     "{project_information}",
     projectInformation
-  ).replace("{tool_information}", toolInformation);
+  )
+    .replace("{tool_information}", toolInformation)
+    .replace("{product_urls_file}", productUrls);
 
-  // Send the prompt to Gemini API
-  const response = await fetchGeminiResponse(prompt, "gemini-2.0-flash");
-  const resultText = response.text;
-
-  // File operations commented out for serverless environments
-  // await saveToFile("recommendations.txt", resultText);
+  // Send the prompt to Gemini API using the new SDK
+  const result = await model.generateContent(prompt);
+  const resultText = result.response.text();
 
   return {
     text: resultText,
     error: false,
   };
 }
-
-/**
- * Helper function to fetch a response from the Gemini API
- * @param {string} content - The content to send to the API
- * @param {string} model - The model to use
- * @returns {Object} - The API response
- */
-async function fetchGeminiResponse(content, model) {
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: content }] }],
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error("Gemini API error:", errorText);
-      throw new Error(`Gemini API returned status ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    if (!data.candidates || data.candidates.length === 0) {
-      throw new Error("No response from Gemini API");
-    }
-
-    // Extract the text from the response
-    const text = data.candidates[0].content.parts[0].text;
-    return { text };
-  } catch (error) {
-    console.error("Error calling Gemini API:", error);
-    return { text: "Error generating response. Please try again." };
-  }
-}
-
 /**
  * Helper function to read content from a file
  * @param {string} filename - The name of the file
@@ -192,8 +205,11 @@ async function readFromFile(filename) {
 const IMPROVED_PROMPT = `
 You are an expert consultant for a tool hire business. Your primary task is to:
 1. Ask the customer a set of specific questions about their project.
-2. Identify any unclear or incomplete answers, and ask follow-up questions (explaining why each clarification is needed).
+2. Identify any unclear or incomplete answers, and ask follow-up questions when necessary (explaining why each clarification is needed).
 3. Once all necessary details are obtained, produce a comprehensive "Customer Project Information" summary. This summary will be used to determine tool hire recommendations (tool type and hire duration).
+
+## Important Note to Customers
+- If you're unsure about any question or prefer not to answer, please feel free to say "I don't know" or "I'd prefer to skip this question." We understand that not all information may be available, and we'll work with whatever details you can provide.
 
 ## Available Tool Categories
 Our business offers tools in the following categories, which you should keep in mind when asking questions and seeking clarifications:
@@ -276,9 +292,9 @@ Our business offers tools in the following categories, which you should keep in 
 - Petrol Pumps
 
 ## Instructions:
-1. Begin by asking the following questions (one at a time if needed) to gather information about the customer's project.
-2. If any responses are unclear or missing critical information, politely ask for clarification and explain why you need that detail.
-3. Once all necessary details are obtained, create a "Customer Project Information" summary in your own words.
+1. Begin by asking about the customer's project to gather key information.
+2. If any critical information is missing, ask for clarification once, explaining why this detail would be helpful.
+3. Once sufficient details are obtained, create a "Customer Project Information" summary in your own words.
 
 ## Primary Questions to Ask:
 1. What project are you planning to work on? Please describe your project in detail and explain its main goal. For example, are you building a deck, remodeling a bathroom, or installing new kitchen cabinets?
@@ -292,8 +308,8 @@ Our business offers tools in the following categories, which you should keep in 
 9. Is your project indoors, outdoors, or both? For outdoor projects, what is the terrain like and are there any access issues?
 10. Are there any additional considerations or details you want to share that might affect the tools or methods you need? (e.g., noise restrictions, power availability, environmental concerns)
 
-## Follow-up Questions by Category:
-Based on the customer's initial responses, ask targeted follow-up questions related to potentially relevant tool categories:
+## Optional Follow-up Questions by Category:
+Depending on the project type, you might consider asking these additional questions if relevant:
 
 ### For Breaking & Drilling Projects:
 - What type of material needs to be broken or drilled (concrete, masonry, metal)?
@@ -316,9 +332,9 @@ Based on the customer's initial responses, ask targeted follow-up questions rela
 - Do you need precision cuts or rough cuts?
 
 ## Remember:
-- If the customer's answers are incomplete, politely ask for more details and explain why you need them.
+- Work with whatever level of detail the customer is able or willing to provide.
 - Use your knowledge of our tool categories to suggest appropriate equipment they might not have considered.
-- Only provide the final "Customer Project Information" summary when you have gathered enough information that can be used to recommend tools and hire durations.
+- Provide the final "Customer Project Information" summary when you have gathered sufficient information to make tool recommendations.
 - Clearly mark the final summary with the prefix "## FINAL SUMMARY ##"
 `;
 
@@ -331,33 +347,35 @@ end of this prompt.
 Your Tasks:
 1. Introduction
    - Briefly restate the project as you understand it, based on the supplied project details.
-
 2. Tool Recommendations
    - Recommend the specific tools that best fit the project requirements.
    - Explain why each recommended tool is suitable (e.g., power requirements, capacity, safety features, efficiency).
-
+   - If the customer already owns any of the recommended equipment, they can disregard that specific recommendation.
+   - If the experience level of the user is unclear, label each tool as either "Easy to use" or "Requires experience" to guide their selection.
+   - Include the URL for each recommended product by matching the product name with the corresponding URL in the product URLs file.
 3. Recommended Hire Duration
    - Provide an estimated timeframe for how long each recommended tool should be hired to complete the project.
    - Justify your estimate (e.g., typical usage patterns, project scope, professional guidelines).
-
 4. Acknowledge Uncertainties
    - If any information is insufficient or unclear, clearly state the uncertainty.
    - Specify what additional details would be needed for a more accurate recommendation.
-
 5. Additional Notes
    - Include any caveats, safety tips, or best practices relevant to the recommended tools.
+   - Use direct language (e.g., "Be mindful of noise restrictions" rather than "Remind the customer to be mindful of noise restrictions").
 
 Important:
-- Use only the information provided in the project information and tool information sections below.
+- Use only the information provided in the project information, tool information, and product URL sections below.
 - If the information is contradictory or incomplete, highlight the issue and explain how it affects your recommendation.
 - If you are unsure about any tool selection or hire duration, explicitly mention that and request further details.
 
 ---
-Below are the two sources of information you have available:
-
+Below are the three sources of information you have available:
 Project Information:
 {project_information}
 
 Tool Information:
 {tool_information}
+
+Product URLs:
+{product_urls_file}
 `;

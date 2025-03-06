@@ -1,8 +1,10 @@
-// File: app/components/ToolHireChatbot.jsx
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
+
+// Constants
+const TIMEOUT_THRESHOLD = 8000; // 8 seconds (below Vercel's 10-second limit)
 
 export default function ToolHireChatbot() {
   const [messages, setMessages] = useState([
@@ -15,15 +17,422 @@ export default function ToolHireChatbot() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [phase, setPhase] = useState("gathering"); // 'gathering' or 'recommendation'
-  const [conversationHistory, setConversationHistory] = useState([]); // Changed from conversationContext to conversationHistory array
+  const [conversationHistory, setConversationHistory] = useState([]);
   const [projectInformation, setProjectInformation] = useState("");
   const streamingEnabled = true; // Always use streaming responses
   const [currentStreamingMessage, setCurrentStreamingMessage] = useState(""); // State to hold current streaming message
   const messagesEndRef = useRef(null);
   const [initialMessageSent, setInitialMessageSent] = useState(false);
-  const [partialResponse, setPartialResponse] = useState(null); // Store partial responses when timeout occurs
-  const abortControllerRef = useRef(null); // To manage fetch request timeouts
-  const timeoutDuration = 9500; // Just under Vercel's 10s limit
+
+  // Timeout handling references
+  const timeoutRef = useRef(null);
+  const responseRef = useRef("");
+  const isStreamingRef = useRef(false);
+  const currentRequestRef = useRef({
+    phase: "gathering",
+    userInput: "",
+    projectInformation: "",
+  });
+
+  // Clear any existing timeout
+  const clearTimeoutTimer = () => {
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  };
+
+  // Reset timeout timer
+  const resetTimeoutTimer = () => {
+    clearTimeoutTimer();
+
+    if (isStreamingRef.current) {
+      timeoutRef.current = setTimeout(() => {
+        console.log("Timeout detected, initiating continuation...");
+        handleTimeout(responseRef.current);
+        isStreamingRef.current = false;
+      }, TIMEOUT_THRESHOLD);
+    }
+  };
+
+  // Start tracking a streaming response
+  const startStreamTracking = (requestInfo) => {
+    isStreamingRef.current = true;
+    responseRef.current = "";
+    currentRequestRef.current = requestInfo;
+    resetTimeoutTimer();
+  };
+
+  // Update the response content as chunks arrive
+  const updateResponseContent = (chunk) => {
+    responseRef.current += chunk;
+    resetTimeoutTimer();
+  };
+
+  // Finish streaming
+  const finishStreamTracking = () => {
+    clearTimeoutTimer();
+    isStreamingRef.current = false;
+  };
+
+  // Handle timeout by initiating continuation
+  const handleTimeout = (partialResponse) => {
+    console.log(
+      "Timeout detected, continuing from:",
+      partialResponse.slice(-100) + "..."
+    );
+
+    // Add a system message indicating timeout
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: "system",
+        content: "Response was cut off due to timeout. Continuing...",
+      },
+    ]);
+
+    // Initiate the continuation request based on the current phase
+    if (currentRequestRef.current.phase === "gathering") {
+      handleContinuationForGathering(
+        currentRequestRef.current.userInput,
+        partialResponse
+      );
+    } else if (currentRequestRef.current.phase === "recommendation") {
+      handleContinuationForRecommendation(
+        currentRequestRef.current.projectInformation,
+        partialResponse
+      );
+    }
+  };
+
+  // New function to add a message to the chat without sending to API
+  const addMessageToChat = (role, content) => {
+    setMessages((prev) => [...prev, { role, content }]);
+  };
+
+  // Continue from a cut-off response in the gathering phase
+  const handleContinuationForGathering = async (userInput, partialResponse) => {
+    setIsLoading(true);
+
+    // Add an empty assistant message for streaming
+    setCurrentStreamingMessage("");
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: "", streaming: true },
+    ]);
+
+    try {
+      // Make the continuation request
+      const response = await fetch("/api/tool-recommendation", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          phase: "gathering",
+          userInput,
+          conversationHistory,
+          streaming: true,
+          continuationMode: true,
+          partialResponse,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server responded with status: ${response.status}`);
+      }
+
+      // Start tracking the new stream
+      startStreamTracking({
+        phase: "gathering",
+        userInput,
+        projectInformation,
+      });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullContent = "";
+      let completeData = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          break;
+        }
+
+        // Process the chunks
+        const chunkText = decoder.decode(value);
+        const chunks = chunkText.split("\n").filter(Boolean);
+
+        for (const chunk of chunks) {
+          try {
+            const data = JSON.parse(chunk);
+
+            if (data.error) {
+              // Handle error
+              setMessages((prev) => {
+                const newMessages = [...prev];
+                // Replace the streaming message with error message
+                if (newMessages[newMessages.length - 1].streaming) {
+                  newMessages.pop(); // Remove streaming placeholder
+                }
+                return [
+                  ...newMessages,
+                  { role: "system", content: data.text, error: true },
+                ];
+              });
+              break;
+            }
+
+            if (!data.done) {
+              // Update the streaming message
+              fullContent += data.chunk;
+              setCurrentStreamingMessage(fullContent);
+              updateResponseContent(data.chunk);
+
+              // Update the last message in the messages array
+              setMessages((prev) => {
+                const newMessages = [...prev];
+                if (newMessages[newMessages.length - 1].streaming) {
+                  newMessages[newMessages.length - 1].content = fullContent;
+                }
+                return newMessages;
+              });
+            } else {
+              // Stream complete, store the final data
+              completeData = data;
+            }
+          } catch (error) {
+            console.error("Error parsing chunk:", error, chunk);
+          }
+        }
+      }
+
+      // Stream is complete, update with final data
+      if (completeData) {
+        finishStreamTracking();
+
+        // Remove the streaming flag
+        setMessages((prev) => {
+          const newMessages = [...prev];
+          if (newMessages[newMessages.length - 1].streaming) {
+            newMessages[newMessages.length - 1].streaming = false;
+          }
+          return newMessages;
+        });
+
+        // Update conversation history
+        if (completeData.conversationHistory) {
+          setConversationHistory(completeData.conversationHistory);
+        }
+
+        // Check if information gathering phase is complete
+        if (completeData.isComplete && phase === "gathering") {
+          setProjectInformation(completeData.projectInformation);
+
+          // Add transition message
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "system",
+              content:
+                "Information gathering complete. Analysing your project needs...",
+            },
+          ]);
+
+          // Switch to recommendation phase
+          setPhase("recommendation");
+
+          // Automatically trigger the recommendation phase
+          setTimeout(() => {
+            handleRecommendationPhase(completeData.projectInformation);
+          }, 1000);
+        }
+      }
+    } catch (error) {
+      console.error("Error in continuation request:", error);
+      setMessages((prev) => {
+        const newMessages = [...prev];
+        // If there's a streaming message, remove it
+        if (
+          newMessages.length > 0 &&
+          newMessages[newMessages.length - 1].streaming
+        ) {
+          newMessages.pop();
+        }
+        return [
+          ...newMessages,
+          {
+            role: "system",
+            content:
+              "Sorry, there was an error continuing the response: " +
+              error.message,
+            error: true,
+          },
+        ];
+      });
+    } finally {
+      setIsLoading(false);
+      setCurrentStreamingMessage("");
+    }
+  };
+
+  // Continue from a cut-off response in the recommendation phase
+  const handleContinuationForRecommendation = async (
+    projectInfo,
+    partialResponse
+  ) => {
+    setIsLoading(true);
+
+    // Add an empty assistant message for streaming
+    setCurrentStreamingMessage("");
+    setMessages((prev) => [
+      ...prev,
+      { role: "assistant", content: "", streaming: true },
+    ]);
+
+    try {
+      // Make the continuation request
+      const response = await fetch("/api/tool-recommendation", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          phase: "recommendation",
+          projectInformation: projectInfo,
+          streaming: true,
+          continuationMode: true,
+          partialResponse,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server responded with status: ${response.status}`);
+      }
+
+      // Start tracking the new stream
+      startStreamTracking({
+        phase: "recommendation",
+        projectInformation: projectInfo,
+      });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullContent = "";
+      let streamComplete = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) {
+          break;
+        }
+
+        // Process the chunks
+        const chunkText = decoder.decode(value);
+        const chunks = chunkText.split("\n").filter(Boolean);
+
+        for (const chunk of chunks) {
+          try {
+            const data = JSON.parse(chunk);
+
+            if (data.error) {
+              // Handle error
+              setMessages((prev) => {
+                const newMessages = [...prev];
+                // Replace the streaming message with error message
+                if (newMessages[newMessages.length - 1].streaming) {
+                  newMessages.pop(); // Remove streaming placeholder
+                }
+                return [
+                  ...newMessages,
+                  { role: "system", content: data.text, error: true },
+                ];
+              });
+              break;
+            }
+
+            if (!data.done) {
+              // Update the streaming message
+              fullContent += data.chunk;
+              setCurrentStreamingMessage(fullContent);
+              updateResponseContent(data.chunk);
+
+              // Update the last message in the messages array
+              setMessages((prev) => {
+                const newMessages = [...prev];
+                if (newMessages[newMessages.length - 1].streaming) {
+                  newMessages[newMessages.length - 1].content = fullContent;
+                }
+                return newMessages;
+              });
+            } else {
+              // Stream complete
+              streamComplete = true;
+              if (data.text) {
+                fullContent = data.text; // Use the complete text if provided
+              }
+            }
+          } catch (error) {
+            console.error("Error parsing chunk:", error, chunk);
+          }
+        }
+      }
+
+      if (streamComplete) {
+        finishStreamTracking();
+
+        // Remove the streaming flag
+        setMessages((prev) => {
+          const newMessages = [...prev];
+          if (newMessages[newMessages.length - 1].streaming) {
+            newMessages[newMessages.length - 1].streaming = false;
+          }
+          return newMessages;
+        });
+
+        // Add final message only if this was the complete recommendation
+        // (not needed for continuation chunks)
+        if (!partialResponse) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              role: "system",
+              content:
+                "Thank you for using our DIY Project Tool Advisor! We hope this helps with your project.",
+            },
+          ]);
+        }
+      }
+    } catch (error) {
+      console.error("Error in continuation request:", error);
+      setMessages((prev) => {
+        const newMessages = [...prev];
+        // If there's a streaming message, remove it
+        if (
+          newMessages.length > 0 &&
+          newMessages[newMessages.length - 1].streaming
+        ) {
+          newMessages.pop();
+        }
+        return [
+          ...newMessages,
+          {
+            role: "system",
+            content:
+              "Sorry, there was an error continuing the response: " +
+              error.message,
+            error: true,
+          },
+        ];
+      });
+    } finally {
+      setIsLoading(false);
+      setCurrentStreamingMessage("");
+    }
+  };
 
   // Use useCallback to memoize the handleSendMessage function
   const handleSendMessage = useCallback(
@@ -34,26 +443,16 @@ export default function ToolHireChatbot() {
         return;
       }
 
-      // If we have a partial response but the user is sending a new message,
-      // ensure we handle the continuation first
-      if (partialResponse && !userMessage) {
-        handleContinueResponse();
-        return;
-      }
-
-      // Add user message to chat only if it's not a continuation
-      if (!partialResponse) {
-        setMessages((prev) => [
-          ...prev,
-          { role: "user", content: messageToSend },
-        ]);
-      }
-
+      // Add user message to chat
+      setMessages((prev) => [
+        ...prev,
+        { role: "user", content: messageToSend },
+      ]);
       setIsLoading(true);
       setInput("");
 
       // Add an empty assistant message for streaming if streaming is enabled
-      if (streamingEnabled && !partialResponse) {
+      if (streamingEnabled) {
         setCurrentStreamingMessage("");
         setMessages((prev) => [
           ...prev,
@@ -63,21 +462,12 @@ export default function ToolHireChatbot() {
 
       try {
         if (streamingEnabled) {
-          // Create abort controller for timeout handling
-          const controller = new AbortController();
-          abortControllerRef.current = controller;
-
-          // Set timeout for the request
-          const timeoutId = setTimeout(() => {
-            // Store the partial response before aborting
-            if (currentStreamingMessage) {
-              setPartialResponse({
-                text: currentStreamingMessage,
-                phase: phase,
-              });
-            }
-            controller.abort();
-          }, timeoutDuration);
+          // Start tracking this stream for timeout detection
+          startStreamTracking({
+            phase,
+            userInput: messageToSend,
+            projectInformation,
+          });
 
           // Streaming implementation
           const response = await fetch("/api/tool-recommendation", {
@@ -90,14 +480,9 @@ export default function ToolHireChatbot() {
               userInput: messageToSend,
               conversationHistory,
               projectInformation,
-              streaming: true,
-              partialResponse: partialResponse, // Include partial response if exists
+              streaming: true, // Request streaming response
             }),
-            signal: controller.signal,
           });
-
-          // Clear the timeout as request completed
-          clearTimeout(timeoutId);
 
           if (!response.ok) {
             throw new Error(`Server responded with status: ${response.status}`);
@@ -105,34 +490,8 @@ export default function ToolHireChatbot() {
 
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
-          let fullContent = partialResponse ? partialResponse.text : "";
+          let fullContent = "";
           let completeData = null;
-
-          // If we're continuing from a partial response, start with that content
-          if (partialResponse) {
-            setCurrentStreamingMessage(fullContent);
-
-            // Replace the last message if it's streaming or add a new one
-            setMessages((prev) => {
-              const newMessages = [...prev];
-              if (
-                newMessages.length > 0 &&
-                newMessages[newMessages.length - 1].role === "assistant" &&
-                newMessages[newMessages.length - 1].streaming
-              ) {
-                // Update existing streaming message
-                newMessages[newMessages.length - 1].content = fullContent;
-              } else {
-                // Add new streaming message
-                newMessages.push({
-                  role: "assistant",
-                  content: fullContent,
-                  streaming: true,
-                });
-              }
-              return newMessages;
-            });
-          }
 
           while (true) {
             const { done, value } = await reader.read();
@@ -169,6 +528,7 @@ export default function ToolHireChatbot() {
                   // Update the streaming message
                   fullContent += data.chunk;
                   setCurrentStreamingMessage(fullContent);
+                  updateResponseContent(data.chunk);
 
                   // Update the last message in the messages array
                   setMessages((prev) => {
@@ -190,8 +550,7 @@ export default function ToolHireChatbot() {
 
           // Stream is complete, update with final data
           if (completeData) {
-            // Clear partial response state as we've successfully completed
-            setPartialResponse(null);
+            finishStreamTracking();
 
             // Remove the streaming flag
             setMessages((prev) => {
@@ -242,7 +601,6 @@ export default function ToolHireChatbot() {
               userInput: messageToSend,
               conversationHistory,
               projectInformation,
-              partialResponse: partialResponse, // Include partial response if exists
             }),
           });
 
@@ -258,9 +616,6 @@ export default function ToolHireChatbot() {
               { role: "system", content: data.text, error: true },
             ]);
           } else {
-            // Clear partial response state
-            setPartialResponse(null);
-
             // Add AI response to chat
             setMessages((prev) => [
               ...prev,
@@ -298,93 +653,39 @@ export default function ToolHireChatbot() {
         }
       } catch (error) {
         console.error("Error sending message:", error);
-
-        // Check if this is an AbortError (timeout)
-        if (error.name === "AbortError") {
-          // Add message to show the user we're continuing due to timeout
-          setMessages((prev) => {
-            const newMessages = [...prev];
-            // Don't remove streaming message as we'll continue from it
-            return [
-              ...newMessages,
-              {
-                role: "system",
-                content:
-                  "The response was cut off due to a timeout. Continuing...",
-                timeout: true,
-              },
-            ];
-          });
-
-          // Auto-continue after a brief delay
-          setTimeout(() => {
-            handleContinueResponse();
-          }, 1000);
-        } else {
-          // Handle other errors
-          setMessages((prev) => {
-            const newMessages = [...prev];
-            // If there's a streaming message, remove it
-            if (
-              newMessages.length > 0 &&
-              newMessages[newMessages.length - 1].streaming
-            ) {
-              newMessages.pop();
-            }
-            return [
-              ...newMessages,
-              {
-                role: "system",
-                content:
-                  "Sorry, there was an error processing your request: " +
-                  error.message,
-                error: true,
-              },
-            ];
-          });
-        }
+        setMessages((prev) => {
+          const newMessages = [...prev];
+          // If there's a streaming message, remove it
+          if (
+            newMessages.length > 0 &&
+            newMessages[newMessages.length - 1].streaming
+          ) {
+            newMessages.pop();
+          }
+          return [
+            ...newMessages,
+            {
+              role: "system",
+              content:
+                "Sorry, there was an error processing your request: " +
+                error.message,
+              error: true,
+            },
+          ];
+        });
       } finally {
         setIsLoading(false);
-        if (!partialResponse) {
-          setCurrentStreamingMessage("");
-        }
+        setCurrentStreamingMessage("");
       }
     },
-    [
-      input,
-      phase,
-      conversationHistory,
-      projectInformation,
-      streamingEnabled,
-      partialResponse,
-      currentStreamingMessage,
-    ]
-  ); // Updated dependencies
+    [input, phase, conversationHistory, projectInformation, streamingEnabled]
+  );
 
-  // Function to handle continuing a response after timeout
-  const handleContinueResponse = useCallback(() => {
-    if (!partialResponse) return;
-
-    // Set loading state but keep the partial message visible
-    setIsLoading(true);
-
-    // Call appropriate handler based on phase
-    if (partialResponse.phase === "gathering") {
-      handleSendMessage(""); // Empty string tells the function we're continuing
-    } else {
-      handleRecommendationPhase(projectInformation, true); // true indicates continuation
-    }
-  }, [partialResponse, projectInformation, handleSendMessage]);
-
-  const handleRecommendationPhase = async (
-    projectInfo,
-    isContinuation = false
-  ) => {
+  const handleRecommendationPhase = async (projectInfo) => {
     setIsLoading(true);
 
     // Add an empty assistant message for streaming if streaming is enabled
-    // and this is not a continuation of a partial response
-    if (streamingEnabled && !isContinuation && !partialResponse) {
+    if (streamingEnabled) {
       setCurrentStreamingMessage("");
       setMessages((prev) => [
         ...prev,
@@ -394,21 +695,11 @@ export default function ToolHireChatbot() {
 
     try {
       if (streamingEnabled) {
-        // Create abort controller for timeout handling
-        const controller = new AbortController();
-        abortControllerRef.current = controller;
-
-        // Set timeout for the request
-        const timeoutId = setTimeout(() => {
-          // Store the partial response before aborting
-          if (currentStreamingMessage) {
-            setPartialResponse({
-              text: currentStreamingMessage,
-              phase: "recommendation",
-            });
-          }
-          controller.abort();
-        }, timeoutDuration);
+        // Start tracking this stream for timeout detection
+        startStreamTracking({
+          phase: "recommendation",
+          projectInformation: projectInfo,
+        });
 
         // Streaming implementation for recommendation phase
         const response = await fetch("/api/tool-recommendation", {
@@ -420,16 +711,8 @@ export default function ToolHireChatbot() {
             phase: "recommendation",
             projectInformation: projectInfo,
             streaming: true,
-            partialResponse:
-              partialResponse && partialResponse.phase === "recommendation"
-                ? partialResponse
-                : null,
           }),
-          signal: controller.signal,
         });
-
-        // Clear the timeout as request completed
-        clearTimeout(timeoutId);
 
         if (!response.ok) {
           throw new Error(`Server responded with status: ${response.status}`);
@@ -437,37 +720,8 @@ export default function ToolHireChatbot() {
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        let fullContent =
-          partialResponse && partialResponse.phase === "recommendation"
-            ? partialResponse.text
-            : "";
+        let fullContent = "";
         let streamComplete = false;
-
-        // If we're continuing from a partial response, start with that content
-        if (partialResponse && partialResponse.phase === "recommendation") {
-          setCurrentStreamingMessage(fullContent);
-
-          // Update the last message if it's streaming or add a new one
-          setMessages((prev) => {
-            const newMessages = [...prev];
-            if (
-              newMessages.length > 0 &&
-              newMessages[newMessages.length - 1].role === "assistant" &&
-              newMessages[newMessages.length - 1].streaming
-            ) {
-              // Update existing streaming message
-              newMessages[newMessages.length - 1].content = fullContent;
-            } else {
-              // Add new streaming message
-              newMessages.push({
-                role: "assistant",
-                content: fullContent,
-                streaming: true,
-              });
-            }
-            return newMessages;
-          });
-        }
 
         while (true) {
           const { done, value } = await reader.read();
@@ -504,6 +758,7 @@ export default function ToolHireChatbot() {
                 // Update the streaming message
                 fullContent += data.chunk;
                 setCurrentStreamingMessage(fullContent);
+                updateResponseContent(data.chunk);
 
                 // Update the last message in the messages array
                 setMessages((prev) => {
@@ -527,8 +782,7 @@ export default function ToolHireChatbot() {
         }
 
         if (streamComplete) {
-          // Clear partial response state as we've successfully completed
-          setPartialResponse(null);
+          finishStreamTracking();
 
           // Remove the streaming flag
           setMessages((prev) => {
@@ -559,10 +813,6 @@ export default function ToolHireChatbot() {
           body: JSON.stringify({
             phase: "recommendation",
             projectInformation: projectInfo,
-            partialResponse:
-              partialResponse && partialResponse.phase === "recommendation"
-                ? partialResponse
-                : null,
           }),
         });
 
@@ -571,9 +821,6 @@ export default function ToolHireChatbot() {
         }
 
         const data = await response.json();
-
-        // Clear partial response state
-        setPartialResponse(null);
 
         setMessages((prev) => [
           ...prev,
@@ -592,80 +839,219 @@ export default function ToolHireChatbot() {
       }
     } catch (error) {
       console.error("Error getting recommendations:", error);
-
-      // Check if this is an AbortError (timeout)
-      if (error.name === "AbortError") {
-        // Add message to show the user we're continuing due to timeout
-        setMessages((prev) => {
-          const newMessages = [...prev];
-          // Don't remove streaming message as we'll continue from it
-          return [
-            ...newMessages,
-            {
-              role: "system",
-              content:
-                "The response was cut off due to a timeout. Continuing...",
-              timeout: true,
-            },
-          ];
-        });
-
-        // Auto-continue after a brief delay
-        setTimeout(() => {
-          handleContinueResponse();
-        }, 1000);
-      } else {
-        // Handle other errors
-        setMessages((prev) => {
-          const newMessages = [...prev];
-          // If there's a streaming message, remove it
-          if (
-            newMessages.length > 0 &&
-            newMessages[newMessages.length - 1].streaming
-          ) {
-            newMessages.pop();
-          }
-          return [
-            ...newMessages,
-            {
-              role: "system",
-              content:
-                "Sorry, there was an error generating recommendations: " +
-                error.message,
-              error: true,
-            },
-          ];
-        });
-      }
+      setMessages((prev) => {
+        const newMessages = [...prev];
+        // If there's a streaming message, remove it
+        if (
+          newMessages.length > 0 &&
+          newMessages[newMessages.length - 1].streaming
+        ) {
+          newMessages.pop();
+        }
+        return [
+          ...newMessages,
+          {
+            role: "system",
+            content:
+              "Sorry, there was an error generating recommendations: " +
+              error.message,
+            error: true,
+          },
+        ];
+      });
     } finally {
       setIsLoading(false);
-      if (!partialResponse) {
-        setCurrentStreamingMessage("");
-      }
+      setCurrentStreamingMessage("");
     }
   };
+
+  // Modified useEffect to show the initial message without sending to API
+  useEffect(() => {
+    if (!initialMessageSent) {
+      // Just add the user message to the UI without sending to API
+      addMessageToChat("user", "Hello! I'd like to discuss my project.");
+
+      // Start loading state for assistant response
+      setIsLoading(true);
+
+      // Add empty assistant message for streaming
+      if (streamingEnabled) {
+        setCurrentStreamingMessage("");
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: "", streaming: true },
+        ]);
+      }
+
+      // Start tracking this stream for timeout detection
+      startStreamTracking({
+        phase,
+        userInput: "",
+        projectInformation,
+        isInitialMessage: true,
+      });
+
+      // Make direct API call for initial message
+      fetch("/api/tool-recommendation", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          phase,
+          userInput: "", // Empty string since we're not sending a real user message
+          conversationHistory,
+          projectInformation,
+          streaming: true,
+          isInitialMessage: true, // Flag to indicate this is just starting the conversation
+        }),
+      })
+        .then((response) => {
+          if (!response.ok) {
+            throw new Error(`Server responded with status: ${response.status}`);
+          }
+          return streamingEnabled ? response.body.getReader() : response.json();
+        })
+        .then(async (data) => {
+          if (streamingEnabled) {
+            // Handle streaming response
+            const reader = data;
+            const decoder = new TextDecoder();
+            let fullContent = "";
+            let completeData = null;
+
+            while (true) {
+              const { done, value } = await reader.read();
+
+              if (done) {
+                break;
+              }
+
+              // Process the chunks
+              const chunkText = decoder.decode(value);
+              const chunks = chunkText.split("\n").filter(Boolean);
+
+              for (const chunk of chunks) {
+                try {
+                  const data = JSON.parse(chunk);
+
+                  if (data.error) {
+                    // Handle error
+                    setMessages((prev) => {
+                      const newMessages = [...prev];
+                      if (newMessages[newMessages.length - 1].streaming) {
+                        newMessages.pop();
+                      }
+                      return [
+                        ...newMessages,
+                        { role: "system", content: data.text, error: true },
+                      ];
+                    });
+                    break;
+                  }
+
+                  if (!data.done) {
+                    // Update the streaming message
+                    fullContent += data.chunk;
+                    setCurrentStreamingMessage(fullContent);
+                    updateResponseContent(data.chunk);
+
+                    // Update the last message in the messages array
+                    setMessages((prev) => {
+                      const newMessages = [...prev];
+                      if (newMessages[newMessages.length - 1].streaming) {
+                        newMessages[newMessages.length - 1].content =
+                          fullContent;
+                      }
+                      return newMessages;
+                    });
+                  } else {
+                    // Stream complete, store the final data
+                    completeData = data;
+                  }
+                } catch (error) {
+                  console.error("Error parsing chunk:", error, chunk);
+                }
+              }
+            }
+
+            // Stream is complete, update with final data
+            if (completeData) {
+              finishStreamTracking();
+
+              // Remove the streaming flag
+              setMessages((prev) => {
+                const newMessages = [...prev];
+                if (newMessages[newMessages.length - 1].streaming) {
+                  newMessages[newMessages.length - 1].streaming = false;
+                }
+                return newMessages;
+              });
+
+              // Update conversation history
+              if (completeData.conversationHistory) {
+                setConversationHistory(completeData.conversationHistory);
+              }
+            }
+          } else {
+            // Non-streaming implementation
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: data.text },
+            ]);
+
+            // Update conversation history
+            if (data.conversationHistory) {
+              setConversationHistory(data.conversationHistory);
+            }
+          }
+        })
+        .catch((error) => {
+          console.error("Error getting initial response:", error);
+          setMessages((prev) => {
+            const newMessages = [...prev];
+            if (
+              newMessages.length > 0 &&
+              newMessages[newMessages.length - 1].streaming
+            ) {
+              newMessages.pop();
+            }
+            return [
+              ...newMessages,
+              {
+                role: "system",
+                content:
+                  "Sorry, there was an error starting the conversation: " +
+                  error.message,
+                error: true,
+              },
+            ];
+          });
+        })
+        .finally(() => {
+          finishStreamTracking();
+          setIsLoading(false);
+          setCurrentStreamingMessage("");
+          setInitialMessageSent(true);
+        });
+    }
+
+    // Cleanup function to clear any timeouts when component unmounts
+    return () => {
+      clearTimeoutTimer();
+    };
+  }, [
+    phase,
+    conversationHistory,
+    projectInformation,
+    streamingEnabled,
+    initialMessageSent,
+  ]);
 
   // Scroll to bottom of messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, currentStreamingMessage]);
-
-  // Initial message from assistant when component mounts
-  useEffect(() => {
-    if (!initialMessageSent) {
-      handleSendMessage("Hello! I'd like to discuss my project.");
-      setInitialMessageSent(true);
-    }
-  }, [handleSendMessage, initialMessageSent]);
-
-  // Cleanup abort controller on unmount
-  useEffect(() => {
-    return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-    };
-  }, []);
 
   // Custom components for ReactMarkdown
   const markdownComponents = {
@@ -748,9 +1134,7 @@ export default function ToolHireChatbot() {
                 message.role === "user"
                   ? "bg-black text-white max-w-3/4"
                   : message.role === "system"
-                  ? message.timeout
-                    ? "bg-yellow-100 text-yellow-800 border-yellow-300 border mx-auto text-center w-full"
-                    : "bg-gray-300 text-gray-800 mx-auto text-center w-full"
+                  ? "bg-gray-300 text-gray-800 mx-auto text-center w-full"
                   : "bg-white text-gray-800 border border-gray-300 max-w-3/4"
               } ${
                 message.error ? "bg-red-100 border-red-300 text-red-800" : ""
@@ -785,31 +1169,16 @@ export default function ToolHireChatbot() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyPress={(e) => e.key === "Enter" && handleSendMessage(input)}
-            placeholder={
-              partialResponse
-                ? "Continuing previous response..."
-                : "Type your message here..."
-            }
-            disabled={
-              isLoading ||
-              phase === "recommendation" ||
-              partialResponse !== null
-            }
+            placeholder="Type your message here..."
+            disabled={isLoading || phase === "recommendation"}
             className="flex-1 p-2 border border-gray-300 rounded-l-lg focus:outline-none focus:ring-2 focus:ring-black"
           />
           <button
-            onClick={() =>
-              partialResponse
-                ? handleContinueResponse()
-                : handleSendMessage(input)
-            }
-            disabled={
-              (isLoading || !input.trim() || phase === "recommendation") &&
-              !partialResponse
-            }
+            onClick={() => handleSendMessage(input)}
+            disabled={isLoading || !input.trim() || phase === "recommendation"}
             className="bg-black hover:bg-black text-white p-2 rounded-r-lg disabled:bg-[#e26e2a]"
           >
-            {isLoading ? "Loading..." : partialResponse ? "Continue" : "Send"}
+            {isLoading ? "Loading..." : "Send"}
           </button>
         </div>
       </div>
