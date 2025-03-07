@@ -104,7 +104,41 @@ export default function ToolHireChatbot() {
       );
     }
   };
+  const handleResetProject = useCallback(() => {
+    // Reset all chat-related states
+    setMessages([
+      {
+        role: "system",
+        content:
+          "Welcome to DIY Project Tool Advisor! Let's find the right tools for your project. Please answer some questions about your project so we can recommend the best tools. The more information you can provide the better recommendations it can make.",
+      },
+    ]);
+    setInput("");
+    setIsLoading(false);
+    setPhase("gathering");
+    setConversationHistory([]);
+    setProjectInformation("");
+    setCurrentStreamingMessage("");
+    setInitialMessageSent(false); // Reset this to trigger the initial message sequence
 
+    // Clear any ongoing timeouts
+    clearTimeoutTimer();
+    responseRef.current = "";
+    isStreamingRef.current = false;
+
+    // Also reset the current request reference
+    currentRequestRef.current = {
+      phase: "gathering",
+      userInput: "",
+      projectInformation: "",
+    };
+
+    // Add a small delay before triggering the initial message sequence
+    setTimeout(() => {
+      // This will trigger the useEffect for initial message
+      setInitialMessageSent(false);
+    }, 100);
+  }, []);
   // New function to add a message to the chat without sending to API
   const addMessageToChat = (role, content) => {
     setMessages((prev) => [...prev, { role, content }]);
@@ -1117,8 +1151,19 @@ export default function ToolHireChatbot() {
 
   return (
     <div className="flex flex-col h-full max-w-5xl mx-auto">
-      <div className="bg-[#e26e2a] text-white p-4 text-center">
+      <div className="bg-[#e26e2a] text-white p-4 text-center flex justify-between items-center">
+        <div className="w-24">
+          {/* Optional: Left spacer to balance the layout */}
+        </div>
         <h1 className="text-xl font-bold">DIY Project Tool Advisor</h1>
+        <div className="w-24 text-right">
+          <button
+            onClick={handleResetProject}
+            className="bg-white text-[#e26e2a] px-3 py-1 rounded hover:bg-gray-100 text-sm font-medium"
+          >
+            Reset Project
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 bg-gray-100">

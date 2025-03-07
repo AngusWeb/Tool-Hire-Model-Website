@@ -1,10 +1,29 @@
-// File: app/api/tool-recommendation/route.js
 import { promises as fs } from "fs";
 import path from "path";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 // API key for Google's Gemini API
 const API_KEY = process.env.API_KEY; // Replace with your actual API key or use environment variables
+
+/**
+ * Initialize the Google Generative AI client
+ * @returns {Object} - The initialized Gemini model
+ */
+function initializeGeminiModel(modelName = "gemini-2.0-flash") {
+  const genAI = new GoogleGenerativeAI(API_KEY);
+  return genAI.getGenerativeModel({
+    model: modelName,
+    generationConfig: {
+      temperature: 0.7,
+      topP: 0.95,
+      topK: 64,
+    },
+    // Set system instructions here instead of sending as a user message
+    systemInstruction: {
+      parts: [{ text: IMPROVED_PROMPT }],
+    },
+  });
+}
 
 /**
  * API route handler for Next.js - handles streaming responses
@@ -188,23 +207,11 @@ async function streamInformationGathering(
             )
           );
         } else {
-          // If this is a new conversation, start with system instructions
+          // If this is a new conversation, start with an empty history
+          // System instructions are already included in the model configuration
           if (!conversationHistory || conversationHistory.length === 0) {
             chat = model.startChat();
-            // Send the system prompt but don't stream its response
-            await chat.sendMessage(IMPROVED_PROMPT);
-
-            // Update conversation history locally (not sent back during streaming)
-            conversationHistory = [
-              {
-                role: "user",
-                parts: [{ text: IMPROVED_PROMPT }],
-              },
-              {
-                role: "model",
-                parts: [{ text: "System initialization complete" }],
-              },
-            ];
+            conversationHistory = []; // Start with empty conversation history
           } else {
             // For existing conversations, use the history
             chat = model.startChat({
@@ -416,23 +423,6 @@ async function streamToolRecommendation(
 }
 
 /**
- * Initialize the Google Generative AI client
- * @returns {Object} - The initialized Gemini model
- */
-function initializeGeminiModel(modelName = "gemini-2.0-flash") {
-  const genAI = new GoogleGenerativeAI(API_KEY);
-  return genAI.getGenerativeModel({
-    model: modelName,
-    generationConfig: {
-      temperature: 0.7,
-      topP: 0.95,
-      topK: 64,
-      maxOutputTokens: 3000, // Setting max token output to 1600
-    },
-  });
-}
-
-/**
  * Convert conversation history to proper format for the chat
  * @param {Array} history - The conversation history array
  * @returns {Array} - Properly formatted history for the API
@@ -498,21 +488,25 @@ async function handleInformationGathering(
       parts: [{ text: aiOutput }],
     });
   } else {
-    // If this is a new conversation, start with system instructions
+    // If this is a new conversation, start directly with user input
+    // System instructions are provided in the model configuration
     if (!conversationHistory || conversationHistory.length === 0) {
-      // First message is always the system prompt
+      // Initialize with an empty chat - system instructions are in model config
       chat = model.startChat();
-      const systemResponse = await chat.sendMessage(IMPROVED_PROMPT);
 
-      // Initialize conversation history
+      // Send the user's first message
+      const result = await chat.sendMessage(userInput);
+      aiOutput = result.response.text();
+
+      // Initialize conversation history with just this first exchange
       conversationHistory = [
         {
           role: "user",
-          parts: [{ text: IMPROVED_PROMPT }],
+          parts: [{ text: userInput }],
         },
         {
           role: "model",
-          parts: [{ text: systemResponse.response.text() }],
+          parts: [{ text: aiOutput }],
         },
       ];
     } else {
@@ -520,22 +514,22 @@ async function handleInformationGathering(
       chat = model.startChat({
         history: formatChatHistory(conversationHistory),
       });
+
+      // Send the user's message
+      const result = await chat.sendMessage(userInput);
+      aiOutput = result.response.text();
+
+      // Add the current interaction to conversation history
+      conversationHistory.push({
+        role: "user",
+        parts: [{ text: userInput }],
+      });
+
+      conversationHistory.push({
+        role: "model",
+        parts: [{ text: aiOutput }],
+      });
     }
-
-    // Send the user's message
-    const result = await chat.sendMessage(userInput);
-    aiOutput = result.response.text();
-
-    // Add the current interaction to conversation history
-    conversationHistory.push({
-      role: "user",
-      parts: [{ text: userInput }],
-    });
-
-    conversationHistory.push({
-      role: "model",
-      parts: [{ text: aiOutput }],
-    });
   }
 
   // Check if the information gathering phase is complete
